@@ -1,0 +1,10 @@
+streamlit>=1.40
+yfinance>=0.2.50
+pandas>=2.2
+numpy>=2.0
+pyarrow
+plotly
+feedparser
+vaderSentiment
+requests
+kiteconnect

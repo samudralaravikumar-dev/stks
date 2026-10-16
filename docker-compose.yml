@@ -1,0 +1,46 @@
+# Always-on deployment: portal + background engine + automatic HTTPS.
+#   sudo bash deploy/setup_server.sh            (first time)
+#   docker compose up -d --build                 (after updating code)
+#   docker compose logs -f app                   (logs; OTP codes appear here in sms provider "console" mode)
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    environment:
+      - TRAD_DATA_DIR=/data
+      - TZ=Asia/Kolkata
+    volumes:
+      - ./data:/data
+      - ./.streamlit/secrets.toml:/app/.streamlit/secrets.toml:ro
+
+  runner:
+    build: .
+    command: ["python", "runner.py"]
+    restart: unless-stopped
+    environment:
+      - TRAD_DATA_DIR=/data
+      - TZ=Asia/Kolkata
+    volumes:
+      - ./data:/data
+      - ./.streamlit/secrets.toml:/app/.streamlit/secrets.toml:ro
+    depends_on:
+      - app
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      - DOMAIN=${DOMAIN}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - app
+
+volumes:
+  caddy_data:
+  caddy_config:

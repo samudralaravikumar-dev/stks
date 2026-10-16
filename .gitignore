@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+.streamlit/secrets.toml
+.kite_session.json
+.upstox_session.json
+trading.db
+users.db
+engine_settings.json

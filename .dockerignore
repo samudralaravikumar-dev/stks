@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+data/
+*.db
+.kite_session.json
+.upstox_session.json
+engine_settings.json
+.streamlit/secrets.toml
+trading_signals_app (1).py
+trading_signals_app.backup.py
+*.zip
