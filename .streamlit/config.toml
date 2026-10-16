@@ -1,0 +1,9 @@
+# Port is passed by run.bat / Dockerfile (8502) so this file also works on Streamlit Community Cloud,
+# which assigns its own port.
+
+[theme]
+base = "dark"
+primaryColor = "#22c55e"
+backgroundColor = "#0b1220"
+secondaryBackgroundColor = "#111c31"
+textColor = "#e6edf7"

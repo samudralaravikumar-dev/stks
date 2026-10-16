@@ -1,0 +1,10 @@
+# HTTPS certificate is obtained and renewed automatically for $DOMAIN.
+{$DOMAIN} {
+	encode gzip
+	reverse_proxy app:8502
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+	}
+}
