@@ -5,6 +5,10 @@ trading_signals_app (1).py
 trading_signals_app.backup.py
 data/
 github_login.bat
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
 .streamlit/secrets.toml
 .kite_session.json
 .upstox_session.json
