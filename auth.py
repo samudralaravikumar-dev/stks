@@ -27,6 +27,7 @@ SCHEMA = """CREATE TABLE IF NOT EXISTS users(
   username TEXT PRIMARY KEY, name TEXT, role TEXT DEFAULT 'user', salt TEXT, pw TEXT,
   fails INTEGER DEFAULT 0, locked_until TEXT, created TEXT, last_login TEXT, mobile TEXT);
 CREATE TABLE IF NOT EXISTS watchlists(username TEXT PRIMARY KEY, symbols TEXT, updated TEXT);
+CREATE TABLE IF NOT EXISTS sessions(token_hash TEXT PRIMARY KEY, username TEXT, created TEXT, expires TEXT, last_seen TEXT);
 CREATE TABLE IF NOT EXISTS otps(
   mobile TEXT, code_hash TEXT, expires TEXT, tries INTEGER DEFAULT 0, sent_at TEXT, used INTEGER DEFAULT 0)"""
 
@@ -99,6 +100,72 @@ def set_mobile(username, mobile):
     except sqlite3.IntegrityError:
         return "That mobile number belongs to another user"
     return None
+
+
+# ---------------- Remember-me sessions (stay signed in until Log out) ----------------
+COOKIE = "srk_session"
+SESSION_DAYS = 30
+
+
+def _th(token):
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def create_session(username):
+    """New random session token (only its hash is stored). Valid SESSION_DAYS, renewed on use."""
+    tok = secrets.token_urlsafe(32)
+    now = datetime.now()
+    with _conn() as c:
+        c.execute("DELETE FROM sessions WHERE expires<?", (now.isoformat(),))
+        c.execute("INSERT INTO sessions(token_hash, username, created, expires, last_seen) VALUES(?,?,?,?,?)",
+                  (_th(tok), username.lower(), now.isoformat(timespec="seconds"),
+                   (now + timedelta(days=SESSION_DAYS)).isoformat(timespec="seconds"), now.isoformat(timespec="seconds")))
+    return tok
+
+
+def session_user(token):
+    """-> user dict for a valid, unexpired token (sliding expiry), else None."""
+    if not isinstance(token, str) or not token or len(token) > 200:
+        return None
+    now = datetime.now()
+    with _conn() as c:
+        r = c.execute("SELECT s.username, s.expires, u.name, u.role FROM sessions s JOIN users u ON u.username=s.username "
+                      "WHERE s.token_hash=?", (_th(token),)).fetchone()
+        if r is None or datetime.fromisoformat(r["expires"]) < now:
+            return None
+        c.execute("UPDATE sessions SET last_seen=?, expires=? WHERE token_hash=?",
+                  (now.isoformat(timespec="seconds"), (now + timedelta(days=SESSION_DAYS)).isoformat(timespec="seconds"),
+                   _th(token)))
+        return dict(username=r["username"], name=r["name"], role=r["role"])
+
+
+def revoke_session(token):
+    if isinstance(token, str) and token:
+        with _conn() as c:
+            c.execute("DELETE FROM sessions WHERE token_hash=?", (_th(token),))
+
+
+def revoke_all_sessions(username):
+    with _conn() as c:
+        c.execute("DELETE FROM sessions WHERE username=?", (username.lower(),))
+
+
+def _cookie_js(value, max_age):
+    """Set/clear the session cookie from a tiny same-origin iframe (Streamlit can read cookies but not set them).
+    The value is our own urlsafe token (or empty), never user input."""
+    value = "".join(ch for ch in value if ch.isalnum() or ch in "-_")
+    st.iframe(
+        f"<script>try{{const d=window.parent.document||document;d.cookie='{COOKIE}={value}; Max-Age={int(max_age)}; "
+        f"Path=/; SameSite=Lax'+(window.parent.location.protocol==='https:'?'; Secure':'');}}catch(e){{"
+        f"document.cookie='{COOKIE}={value}; Max-Age={int(max_age)}; Path=/; SameSite=Lax';}}</script>", height=1)
+
+
+def _remember(user):
+    """Log the user in for this browser: session state now, cookie on the next render."""
+    tok = create_session(user["username"])
+    st.session_state["user"] = user
+    st.session_state["session_token"] = tok
+    st.session_state["cookie_pending"] = tok
 
 
 # ---------------- Per-user watchlist ----------------
@@ -239,6 +306,7 @@ def set_password(username, password):
     with _conn() as c:
         c.execute("UPDATE users SET salt=?, pw=?, fails=0, locked_until=NULL WHERE username=?",
                   (salt, _hash(password, salt), username.lower()))
+        c.execute("DELETE FROM sessions WHERE username=?", (username.lower(),))  # sign out every device
     return None
 
 
@@ -280,9 +348,26 @@ def set_role(username, role):
 
 # ---------------- Streamlit gate ----------------
 def gate():
-    """Render login / first-run setup until authenticated. -> user dict (stops the script otherwise)."""
+    """Render login / first-run setup until authenticated. -> user dict (stops the script otherwise).
+    A remember-me cookie keeps the user signed in across reloads, reconnects and app restarts until Log out."""
+    if st.session_state.get("cookie_clear"):
+        _cookie_js("", 0)
+        st.session_state.pop("cookie_clear", None)
     if st.session_state.get("user"):
+        if st.session_state.get("cookie_pending"):
+            _cookie_js(st.session_state.pop("cookie_pending"), SESSION_DAYS * 86400)
         return st.session_state["user"]
+    try:
+        tok = st.context.cookies.get(COOKIE)
+    except Exception:
+        tok = None
+    if not isinstance(tok, str):
+        tok = None
+    u = session_user(tok) if tok else None
+    if u:
+        st.session_state["user"] = u
+        st.session_state["session_token"] = tok
+        return u
     _, mid, _ = st.columns([1, 1.2, 1])
     with mid:
         st.markdown("## 📈 Intraday CALL / PUT Engine")
@@ -302,7 +387,7 @@ def gate():
                         if err:
                             st.error(err)
                         else:
-                            st.session_state["user"] = verify(user, pw)[0]
+                            _remember(verify(user, pw)[0])
                             st.rerun()
         else:
             t_otp, t_pw = st.tabs(["📱 Mobile OTP", "🔑 Password"])
@@ -321,7 +406,7 @@ def gate():
                             u, err = verify_otp(mob, code)
                             if u:
                                 st.session_state.pop("otp_sent", None)
-                                st.session_state["user"] = u
+                                _remember(u)
                                 st.rerun()
                             st.error(err)
                 if sms_provider() == "console":
@@ -333,14 +418,22 @@ def gate():
                     if st.form_submit_button("Log in", type="primary", use_container_width=True):
                         u, err = verify(user, pw)
                         if u:
-                            st.session_state["user"] = u
+                            _remember(u)
                             st.rerun()
                         st.error(err)
-            st.caption("Ask your admin for an account. Educational tool, not financial advice.")
+            st.caption(f"You stay signed in on this device for {SESSION_DAYS} days (renewed each visit) until you press "
+                       "Log out. Ask your admin for an account. Educational tool, not financial advice.")
     st.stop()
 
 
 def logout():
-    for k in ("user", "last_results"):
+    """Ends this device's session: revokes the token server-side and clears the cookie."""
+    revoke_session(st.session_state.get("session_token"))
+    try:
+        revoke_session(st.context.cookies.get(COOKIE))
+    except Exception:
+        pass
+    for k in ("user", "last_results", "session_token", "cookie_pending"):
         st.session_state.pop(k, None)
+    st.session_state["cookie_clear"] = True
     st.rerun()

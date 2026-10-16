@@ -32,6 +32,7 @@ SESSION_FILE = Path(os.environ.get("TRAD_DATA_DIR") or Path(__file__).parent) / 
 INSTRUMENTS_URL = "https://assets.upstox.com/market-quote/instruments/exchange/{ex}.json.gz"
 INDEX_KEYS = {"NIFTY": "NSE_INDEX|Nifty 50", "BANKNIFTY": "NSE_INDEX|Nifty Bank",
               "FINNIFTY": "NSE_INDEX|Nifty Fin Service", "SENSEX": "BSE_INDEX|SENSEX"}
+VIX_KEY = "NSE_INDEX|India VIX"
 MCX_MAP = {"CRUDE": "CRUDEOIL", "CRUDEOIL": "CRUDEOIL", "NATURALGAS": "NATURALGAS", "NATGAS": "NATURALGAS"}
 UNITS = {"1m": 1, "5m": 5, "15m": 15}
 PERIOD_DAYS = {"5d": 7, "7d": 9, "1mo": 31, "30d": 31, "60d": 60}
@@ -238,6 +239,23 @@ def candles(token, key, interval, period):
     return df[~df.index.duplicated()].sort_index() if len(df) else df
 
 
+@st.cache_data(ttl=10, show_spinner=False)
+def quotes(token, keys):
+    """Full market quotes for up to ~500 instrument keys in one call -> {instrument_key: quote dict}.
+    Each quote: last_price, net_change, ohlc, volume, average_price, depth{buy,sell}[5], circuits, last_trade_time."""
+    out = {}
+    keys = [k for k in keys if k]
+    for i in range(0, len(keys), 450):
+        try:
+            data = api(token, "/v2/market-quote/quotes", {"instrument_key": ",".join(keys[i:i + 450])})
+        except Exception:
+            continue
+        for v in data.values():
+            if v.get("instrument_token"):
+                out[v["instrument_token"]] = v
+    return out
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def option_chain(token, chain_key, day):
     """Nearest expiry chain -> dict(expiry 'DD-Mon-YYYY', lot, quotes {strike: {CE/PE: ltp, bid, ask, iv, oi, doi,
@@ -262,7 +280,7 @@ def option_chain(token, chain_key, day):
                 quotes.setdefault(float(r["strike_price"]), {})[side] = dict(
                     ltp=md.get("ltp") or 0.0, bid=md.get("bid_price") or 0.0, ask=md.get("ask_price") or 0.0,
                     iv=gk.get("iv") or 0.0, oi=oi, doi=(oi - prev) if prev is not None else 0,
-                    delta=gk.get("delta"), theta=gk.get("theta"))
+                    delta=gk.get("delta"), theta=gk.get("theta"), pop=gk.get("pop"))
         if not quotes:
             return None
         return dict(expiry=datetime.strptime(exp, "%Y-%m-%d").strftime("%d-%b-%Y"), lot=lot, quotes=quotes, spot=spot)

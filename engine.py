@@ -564,7 +564,7 @@ def option_plan(spec, row, ltp, P, chain, iv, now):
         notes.append("Expiry day: gamma and theta are extreme. Prefer ITM and exit fast")
     if abs(delta) < 0.3:
         notes.append(f"Low delta {delta:+.2f}: the option barely moves with the underlying")
-    return dict(kind=kind, strike=K, prem=prem, live=live is not None, model=model, delta=delta, theta=theta,
+    return dict(kind=kind, strike=K, prem=prem, live=live is not None, model=model, delta=delta, theta=theta, pop=q.get("pop"),
                 p_sl=p_sl, p_t1=p_t1, p_t2=p_t2, stop=stop, t1=t1, t2=t2, entry=entry, lot=lot, lots=lots,
                 risk=risk_lot * lots, dte=dte, expiry=(chain or {}).get("expiry"), notes=notes)
 
@@ -648,7 +648,7 @@ def side_analysis(spec, row, ltp, P, chain, iv, now, tg):
                      labels=z["labels"]) for z in fav]
         stop_lvl = adv[0]["level"] if adv else ltp - (1 if kind == "CE" else -1) * 1.5 * row.ATR
         p_sl = max(bs(stop_lvl, K, Te, iv, kind, r)[0] * cal, prem * (1 - P["max_loss"]))
-        out[kind] = dict(strike=K, prem=prem, live=live is not None, delta=delta, theta=theta, iv_k=q.get("iv"),
+        out[kind] = dict(strike=K, prem=prem, live=live is not None, delta=delta, theta=theta, iv_k=q.get("iv"), pop=q.get("pop"),
                          oi=q.get("oi"), doi=q.get("doi"), breakeven=K + prem if kind == "CE" else K - prem,
                          targets=tgts, stop_lvl=stop_lvl, p_sl=p_sl,
                          rr=((tgts[0]["prem"] - prem) / max(prem - p_sl, 1e-9)) if tgts else np.nan)
@@ -1284,7 +1284,7 @@ def recommend(a, P):
         return base | dict(action=f"BUY {'CALL' if dr > 0 else 'PUT'}", mode="now", kind=p["kind"], strike=p["strike"],
                            expiry=p["expiry"], live=p["live"], prem=p["prem"], sl=p["p_sl"], t1=p["p_t1"], t2=p["p_t2"],
                            u_entry=p["entry"], u_sl=p["stop"], u_t1=p["t1"], u_t2=p["t2"], trigger=None,
-                           conf=a["conf"], setup=row.Setups, delta=p["delta"],
+                           conf=a["conf"], setup=row.Setups, delta=p["delta"], pop=p.get("pop"),
                            notes=[n for n in p["notes"] if "budget" not in n])
 
     def conditional(kind):
@@ -1306,7 +1306,7 @@ def recommend(a, P):
         entry = prem_at(trig)
         return dict(kind=kind, strike=s["strike"], live=s["live"], prem=entry, sl=max(prem_at(u_sl), entry * (1 - P["max_loss"])),
                     t1=prem_at(u_t1), t2=prem_at(u_t2), u_entry=trig, u_sl=u_sl, u_t1=u_t1, u_t2=u_t2, trigger=trig,
-                    delta=s["delta"], now_prem=s["prem"], prob=zs[0]["prob"])
+                    delta=s["delta"], now_prem=s["prem"], prob=zs[0]["prob"], pop=s.get("pop"))
 
     need = row.Need
     lean = "CE" if row.Score >= need else "PE" if row.Score <= -need else None

@@ -34,8 +34,12 @@ def save_watchlist():
 
 
 def wl_add_one():
+    wl_add_from("wl_search")
+
+
+def wl_add_from(key):
     """Search box callback: add the picked symbol immediately and clear the box."""
-    pick = st.session_state.get("wl_search")
+    pick = st.session_state.get(key)
     if pick:
         sym = symbols.to_symbol(pick)
         if sym not in wl_list():
@@ -44,7 +48,7 @@ def wl_add_one():
             st.session_state["wl_flash"] = f"Added {sym}"
         else:
             st.session_state["wl_flash"] = f"{sym} is already in your watchlist"
-    st.session_state["wl_search"] = None
+    st.session_state[key] = None
 
 
 def wl_quick_add():
@@ -161,7 +165,11 @@ with st.sidebar:
                     st.error("New passwords do not match")
                 else:
                     err = auth.set_password(user["username"], new_pw)
-                    st.error(err) if err else st.success("Password changed")
+                    if err:
+                        st.error(err)
+                    else:
+                        auth._remember(user)  # other devices are signed out; keep this one signed in
+                        st.success("Password changed. Other devices were signed out.")
     if cu2.button("Log out", use_container_width=True):
         auth.logout()
     st.divider()
@@ -1308,41 +1316,208 @@ def track_tab():
                "multiples of the planned risk (entry to stop). Logged ideas are not trades: see Paper trading for P&L.")
 
 
-TABS = ["🏠 Dashboard", "⭐ Watchlist", "📈 NIFTY 50", "✅ Track record", "⚡ Stock → CALL/PUT", "🔎 Analysis", "🧠 Options analytics", "🌐 Market intel",
+def _quote_key(sym):
+    try:
+        u = upstox_feed.underlying(sym, resolve(sym)["kind"], kite_day())
+        return u["key"] if u else None
+    except Exception:
+        return None
+
+
+INDEX_STRIP = [("NIFTY 50", "NIFTY", "^NSEI"), ("SENSEX", "SENSEX", "^BSESN"), ("BANK NIFTY", "BANKNIFTY", "^NSEBANK"),
+               ("FIN NIFTY", "FINNIFTY", "NIFTY_FIN_SERVICE.NS"), ("INDIA VIX", None, "^INDIAVIX")]
+
+
+def _pc(ltp, ch):
+    prev = (ltp or 0) - (ch or 0)
+    return (ch / prev * 100) if prev else None
+
+
+def home_tab():
+    now = pd.Timestamp.now(tz=IST)
+    res = st.session_state.get("last_results")
+    if not res:
+        res, _, _ = run_scan(now)
+    wl = wl_list()
+    tok = E.UPSTOX
+    qkeys = {s: _quote_key(s) for s in wl} if tok else {}
+    ikeys = {n: (upstox_feed.INDEX_KEYS[k] if k else upstox_feed.VIX_KEY) for n, k, _ in INDEX_STRIP}
+    q = upstox_feed.quotes(tok, tuple(dict.fromkeys(list(ikeys.values()) + [k for k in qkeys.values() if k]))) if tok else {}
+    items = []
+    for name, _, yt in INDEX_STRIP:
+        v = q.get(ikeys[name])
+        if v:
+            items.append((name, f"{v['last_price']:,.2f}", v.get("net_change"), _pc(v["last_price"], v.get("net_change"))))
+        else:
+            lc, chg = last_close(yt)
+            items.append((name, f"{lc:,.2f}" if lc else "n/a", (lc * chg / (1 + chg)) if lc and chg is not None else None,
+                          chg * 100 if chg is not None else None))
+    st.html(ui_kit.kite_strip(items))
+
+    left, right = st.columns([4, 8], gap="medium")
+    with left:
+        st.markdown(f"**Watchlist** <small style='color:#8ea0bf'>({len(wl)})</small>", unsafe_allow_html=True)
+        st.selectbox("Search & add", [x for x in symbols.labels() if symbols.to_symbol(x) not in wl], index=None,
+                     key="home_search", on_change=wl_add_from, args=("home_search",), accept_new_options=True,
+                     placeholder="🔍 Search eg: infy, nifty, tata…", label_visibility="collapsed")
+        rows = []
+        for s in wl:
+            a = res.get(s)
+            v = q.get(qkeys.get(s)) if tok else None
+            if v:
+                ltp, ch = v["last_price"], v.get("net_change")
+            elif a and "error" not in a:
+                ltp, ch = a["ltp"], (a["ltp"] - a["row"].PDC) if pd.notna(a["row"].PDC) else None
+            else:
+                ltp, ch = None, None
+            sig = "·"
+            if a and "error" not in a:
+                r = recommend(a, P)
+                sig = ("▲ CALL" if r["kind"] == "CE" else "▼ PUT") + ("" if r["mode"] == "now" else " ⏳") if r["mode"] != "none" else "·"
+            rows.append({"Instrument": s, "LTP": ltp, "Chg": ch, "Chg %": _pc(ltp, ch) if ltp and ch is not None else None,
+                         "Signal": sig})
+        if not rows:
+            st.info("Search above to add stocks.")
+            return
+        wdf = pd.DataFrame(rows)
+
+        def col(v):
+            try:
+                return "color:#4caf50" if float(v) > 0 else "color:#ef5350" if float(v) < 0 else ""
+            except (TypeError, ValueError):
+                s = str(v)
+                return ("color:#4caf50;font-weight:700" if "CALL" in s else "color:#ef5350;font-weight:700" if "PUT" in s
+                        else "color:#64748b")
+        ev = st.dataframe(wdf.style.map(col, subset=["Chg", "Chg %", "Signal"]), hide_index=True, width="stretch",
+                          on_select="rerun", selection_mode="single-row", key="home_wl",
+                          height=min(40 + 35 * len(wdf), 760),
+                          column_config={"LTP": st.column_config.NumberColumn(format="%.2f"),
+                                         "Chg": st.column_config.NumberColumn(format="%+.2f"),
+                                         "Chg %": st.column_config.NumberColumn(format="%+.2f%%")})
+        picked = ev.selection.rows if ev and ev.selection else []
+        if picked:
+            st.session_state["home_sel"] = wdf.Instrument.iloc[picked[0]]
+        sel = st.session_state.get("home_sel")
+        if sel not in wl:
+            sel = wl[0]
+        st.caption("Tap a row to open it · ▲ CALL / ▼ PUT = signal, ⏳ = waiting for trigger")
+        if st.button(f"✕ Remove {sel}", key="home_del", use_container_width=True):
+            wl_delete(sel)
+            st.rerun()
+
+    with right:
+        a = res.get(sel)
+        if a is None or "error" in a:
+            with st.spinner(f"Loading {sel}…"):
+                a = _get_analysis(sel)
+        if "error" in a:
+            st.error(f"{sel}: {a['error']}")
+            return
+        r = recommend(a, P)
+        v = q.get(qkeys.get(sel)) if tok else None
+        ltp, ch = (v["last_price"], v.get("net_change")) if v else (a["ltp"], (a["ltp"] - a["row"].PDC)
+                                                                      if pd.notna(a["row"].PDC) else None)
+        exch = {"index": "INDEX", "commodity": "MCX", "stock": "NSE"}[a["spec"]["kind"]]
+
+        def side(x, kind, conditional):
+            if not x:
+                return None
+            word = "BUY CALL" if kind == "CE" else "BUY PUT"
+            when = (f"if {'above' if kind == 'CE' else 'below'} {x['u_entry']:,.2f} · " if conditional else "")
+            return (f"{word} · {x['strike']:g} {kind} @ {x['prem']:.2f}",
+                    f"{when}SL {x['sl']:.2f} · T1 {x['t1']:.2f} · T2 {x['t2']:.2f}"
+                    + (f" · Upstox POP {x['pop']:.0f}%" if x.get("pop") is not None else ""))
+        if r["mode"] == "none":
+            up_, dn_ = r["alt"]
+            buy, sell = side(up_, "CE", True), side(dn_, "PE", True)
+        else:
+            buy = side(r, "CE", r["mode"] == "trigger") if r["kind"] == "CE" else None
+            sell = side(r, "PE", r["mode"] == "trigger") if r["kind"] == "PE" else None
+        st.html(ui_kit.quote_header(sel, exch, ltp, ch, _pc(ltp, ch) if ch is not None else None, buy, sell))
+        status = (f"**{r['action']}** · confidence {r['conf']}" if r["mode"] != "none" else
+                  f"**No trade** · score {r['score']:+.1f}: conditional plans shown on the buttons")
+        st.caption(status + " · display only: place orders in your broker app")
+        for n in r.get("notes", [])[:2]:
+            st.caption("⚠ " + n)
+        t_chart, t_depth, t_chain, t_reco = st.tabs(["Chart", "Market depth", "Option chain", "Recommendation"])
+        with t_chart:
+            st.plotly_chart(make_chart(a["d"], sel, a["spec"], a["has_vol"]), width="stretch", key="home_chart")
+        with t_depth:
+            if v:
+                st.html(ui_kit.depth_html(v))
+                if not (v.get("depth") or {}).get("buy") or not any(x.get("price") for x in v["depth"]["buy"]):
+                    st.caption("Depth is empty outside market hours or for indices.")
+            else:
+                st.info("Market depth needs the Upstox data source (sidebar).")
+        with t_chain:
+            if a.get("chain"):
+                st.dataframe(oi_table(a["chain"], ltp), hide_index=True, width="stretch")
+                st.caption(f"{a['chain']['source']} · expiry {a['chain']['expiry']} · PCR {a['chain']['pcr'] or 0:.2f} · "
+                           f"max pain {a['chain']['max_pain']:g}")
+            else:
+                st.info("No option chain for this symbol.")
+        with t_reco:
+            st.html(ui_kit.reco_card(r, _chg(a), ui_kit.sparkline(_spark(a))))
+
+    st.markdown("#### Positions")
+    tr = paper.trades_df()
+    opn = tr[tr.status == "OPEN"]
+    if opn.empty:
+        st.caption("No open paper positions. Paper trades open automatically when a BUY CALL / BUY PUT signal fires.")
+    else:
+        pnl = np.where(opn.half == 1, (opn.half_p - opn.entry_p) * opn.qty / 2 + (opn.last_p - opn.entry_p) * opn.qty / 2,
+                       (opn.last_p - opn.entry_p) * opn.qty)
+        pos = pd.DataFrame({"Instrument": opn.symbol + " " + opn.strike.map(lambda x: f"{x:g}") + " " + opn.kind,
+                            "Qty.": opn.qty.where(opn.half == 0, opn.qty / 2).astype(int), "Avg.": opn.entry_p,
+                            "LTP": opn.last_p, "P&L": pnl, "Chg %": (opn.last_p / opn.entry_p - 1) * 100,
+                            "SL": opn.sl_p, "T1": opn.t1_p, "T2": opn.t2_p})
+        tot = float(pnl.sum())
+        st.dataframe(pos.style.map(lambda x: "color:#4caf50" if x > 0 else "color:#ef5350" if x < 0 else "",
+                                   subset=["P&L", "Chg %"]), hide_index=True, width="stretch",
+                     column_config={c: st.column_config.NumberColumn(format="%.2f") for c in
+                                    ("Avg.", "LTP", "P&L", "SL", "T1", "T2")} | {
+                         "Chg %": st.column_config.NumberColumn(format="%+.2f%%")})
+        st.markdown(f"Total P&L <span style='color:{'#4caf50' if tot >= 0 else '#ef5350'};font-weight:700'>"
+                    f"₹{tot:,.0f}</span> <small style='color:#8ea0bf'>(paper)</small>", unsafe_allow_html=True)
+
+
+TABS = ["🏠 Home", "📊 Signals board", "⭐ Watchlist", "📈 NIFTY 50", "✅ Track record", "⚡ Stock → CALL/PUT", "🔎 Analysis", "🧠 Options analytics", "🌐 Market intel",
         "💰 CE/PE price check", "🧮 Spread builder", "📒 Paper trading & alerts", "🚀 Momentum scanner",
         "🎯 Position manager", "📖 Method"] + (["👥 Users"] if user["role"] == "admin" else [])
 tabs = st.tabs(TABS)
 with tabs[0]:
-    st.fragment(dashboard, run_every=every if auto else None)()
+    st.fragment(home_tab, run_every=every if auto else None)()
 with tabs[1]:
-    watchlist_tab()
+    st.fragment(dashboard, run_every=every if auto else None)()
 with tabs[2]:
-    nifty50_tab()
+    watchlist_tab()
 with tabs[3]:
-    track_tab()
+    nifty50_tab()
 with tabs[4]:
-    quick_tab()
+    track_tab()
 with tabs[5]:
-    analysis_tab()
+    quick_tab()
 with tabs[6]:
-    options_tab()
+    analysis_tab()
 with tabs[7]:
-    market_tab()
+    options_tab()
 with tabs[8]:
-    price_check()
+    market_tab()
 with tabs[9]:
-    spread_tab()
+    price_check()
 with tabs[10]:
-    paper_tab(SYMBOLS)
+    spread_tab()
 with tabs[11]:
-    scanner()
+    paper_tab(SYMBOLS)
 with tabs[12]:
+    scanner()
+with tabs[13]:
     position_manager()
 if user["role"] == "admin":
-    with tabs[14]:
+    with tabs[15]:
         users_tab()
 
-with tabs[13]:
+with tabs[14]:
     st.markdown("""
 **Six parameter groups** feed the confluence score, each shown with its own sub-score:
 1. **Moving averages** (trend direction): EMA9/21/50, VWAP, Supertrend, ADX/DMI, 15- and 60-min trend

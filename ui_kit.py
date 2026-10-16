@@ -84,6 +84,30 @@ CSS = """
 .tk .tile .t2{font-size:12px;color:var(--mut);margin:2px 0 4px}
 .tk .tile .t3{font-size:11px;color:#cbd5e1;margin-top:3px}
 .tk .empty{background:var(--card);border:1px dashed var(--line);border-radius:16px;padding:22px;color:var(--mut);text-align:center}
+.kt *{box-sizing:border-box;font-family:Inter,"Segoe UI",system-ui,sans-serif}
+.kt .strip{display:flex;gap:26px;flex-wrap:wrap;align-items:baseline;padding:8px 2px 12px;border-bottom:1px solid #1e2d4a;margin-bottom:12px}
+.kt .strip .it{display:flex;gap:8px;align-items:baseline;white-space:nowrap}
+.kt .strip .n{font-size:12px;color:#8ea0bf;font-weight:600;letter-spacing:.03em}
+.kt .strip .v{font-size:15px;font-weight:700;color:#e6edf7;font-variant-numeric:tabular-nums}
+.kt .strip .c{font-size:12px;font-weight:600;font-variant-numeric:tabular-nums}
+.kt .up{color:#4caf50}.kt .dn{color:#ef5350}.kt .mut{color:#8ea0bf}
+.kt .qh{display:flex;justify-content:space-between;align-items:flex-end;gap:12px;flex-wrap:wrap;padding:4px 0 10px;border-bottom:1px solid #1e2d4a}
+.kt .qh .s{font-size:22px;font-weight:800;color:#e6edf7}
+.kt .qh .ex{font-size:11px;color:#8ea0bf;border:1px solid #2b3b5c;border-radius:4px;padding:1px 6px;margin-left:8px;vertical-align:middle}
+.kt .qh .p{font-size:26px;font-weight:800;font-variant-numeric:tabular-nums;color:#e6edf7}
+.kt .qh .pc{font-size:14px;font-weight:600;margin-left:8px}
+.kt .btns{display:flex;gap:10px;flex-wrap:wrap;margin:12px 0 4px}
+.kt .b{flex:1;min-width:210px;border-radius:6px;padding:10px 14px;font-weight:700;color:#fff;font-size:14px}
+.kt .b small{display:block;font-weight:500;font-size:11.5px;opacity:.9;margin-top:2px}
+.kt .b.buy{background:#2e7d32}.kt .b.sell{background:#c62828}.kt .b.off{background:#263247;color:#94a3b8}
+.kt table.depth{width:100%;border-collapse:collapse;font-size:12.5px;font-variant-numeric:tabular-nums}
+.kt table.depth th{color:#8ea0bf;font-weight:600;text-align:right;padding:5px 8px;border-bottom:1px solid #1e2d4a}
+.kt table.depth td{text-align:right;padding:4px 8px;border-bottom:1px solid #131f36}
+.kt table.depth td.bid{color:#64b5f6}.kt table.depth td.ask{color:#ef5350}
+.kt table.depth tr.tot td{font-weight:700;color:#e6edf7;border-top:1px solid #1e2d4a}
+.kt .stats{display:grid;grid-template-columns:repeat(4,1fr);gap:8px 18px;margin-top:12px;font-size:12.5px}
+.kt .stats .l{color:#8ea0bf}.kt .stats .v{color:#e6edf7;font-weight:600;font-variant-numeric:tabular-nums}
+.kt .bar{height:5px;background:#1f2937;border-radius:4px;overflow:hidden;display:flex;margin-top:8px}
 .tk .tag.nt{background:rgba(148,163,184,.12);color:#cbd5e1;border:1px solid rgba(148,163,184,.4)}
 </style>
 """
@@ -251,6 +275,65 @@ def preview(path, body_html):
                 f'{CSS}</head><body>{body_html}</body></html>')
 
 
+def kite_strip(items):
+    """Broker-style index ticker: [(name, value, abs change or None, pct change or None)]."""
+    cells = []
+    for name, val, ch, pc in items:
+        cls = "up" if (ch or 0) >= 0 else "dn"
+        chg = (f'<span class="c {cls}">{ch:+,.2f} ({pc:+.2f}%)</span>' if ch is not None and pc is not None else "")
+        cells.append(f'<div class="it"><span class="n">{escape(name)}</span><span class="v">{val}</span>{chg}</div>')
+    return f'<div class="kt"><div class="strip">{"".join(cells)}</div></div>'
+
+
+def quote_header(sym, exch, ltp, ch, pc, buy=None, sell=None):
+    """Symbol header with price/change and two order-pad style action buttons (display only, no orders)."""
+    cls = "up" if (ch or 0) >= 0 else "dn"
+    chg = f'<span class="pc {cls}">{ch:+,.2f} ({pc:+.2f}%)</span>' if ch is not None and pc is not None else ""
+
+    def btn(x, kind):
+        if not x:
+            return f'<div class="b off">{"BUY CALL" if kind == "buy" else "BUY PUT"}<small>no signal</small></div>'
+        return f'<div class="b {kind}">{escape(x[0])}<small>{escape(x[1])}</small></div>'
+    return (f'<div class="kt"><div class="qh"><div><span class="s">{escape(sym)}</span><span class="ex">{escape(exch)}</span></div>'
+            f'<div><span class="p">{_f(ltp)}</span>{chg}</div></div>'
+            f'<div class="btns">{btn(buy, "buy")}{btn(sell, "sell")}</div></div>')
+
+
+def depth_html(q):
+    """Kite-style 5-level market depth + quote stats from an Upstox full quote."""
+    d = q.get("depth") or {}
+    buy, sell = (d.get("buy") or [])[:5], (d.get("sell") or [])[:5]
+    rows = []
+    for i in range(5):
+        b = buy[i] if i < len(buy) else {}
+        s = sell[i] if i < len(sell) else {}
+        rows.append(f'<tr><td class="bid">{_f(b.get("price") or 0)}</td><td class="bid">{b.get("orders") or 0}</td>'
+                    f'<td class="bid">{(b.get("quantity") or 0):,}</td><td class="ask">{_f(s.get("price") or 0)}</td>'
+                    f'<td class="ask">{s.get("orders") or 0}</td><td class="ask">{(s.get("quantity") or 0):,}</td></tr>')
+    tb, ts = q.get("total_buy_quantity") or 0, q.get("total_sell_quantity") or 0
+    rows.append(f'<tr class="tot"><td colspan="3">Total {int(tb):,}</td><td colspan="3">Total {int(ts):,}</td></tr>')
+    share = tb / (tb + ts) * 100 if tb + ts else 50
+    o = q.get("ohlc") or {}
+    ltt = q.get("last_trade_time")
+    try:
+        from datetime import datetime
+        ltt = datetime.fromtimestamp(int(ltt) / 1000).strftime("%H:%M:%S")
+    except Exception:
+        ltt = "-"
+    stat = lambda l, v: f'<div><div class="l">{l}</div><div class="v">{v}</div></div>'
+    prev = (q.get("last_price") or 0) - (q.get("net_change") or 0)
+    stats = "".join([stat("Open", _f(o.get("open") or 0)), stat("High", _f(o.get("high") or 0)),
+                     stat("Low", _f(o.get("low") or 0)), stat("Prev. close", _f(prev)),
+                     stat("Volume", f'{int(q.get("volume") or 0):,}'), stat("Avg. price", _f(q.get("average_price") or 0)),
+                     stat("Lower circuit", _f(q.get("lower_circuit_limit") or 0)),
+                     stat("Upper circuit", _f(q.get("upper_circuit_limit") or 0)), stat("Last trade", ltt)])
+    return (f'<div class="kt"><table class="depth"><tr><th>Bid</th><th>Orders</th><th>Qty.</th><th>Offer</th>'
+            f'<th>Orders</th><th>Qty.</th></tr>{"".join(rows)}</table>'
+            f'<div class="bar"><div style="width:{share:.0f}%;background:#64b5f6"></div>'
+            f'<div style="width:{100 - share:.0f}%;background:#ef5350"></div></div>'
+            f'<div class="stats">{stats}</div></div>')
+
+
 def reco_card(r, chg=None, spark=None, gamma=None):
     """One-stock recommendation card: BUY CALL / BUY PUT (now or on trigger) or NO TRADE with both conditional plans."""
     kind = r.get("kind")
@@ -271,6 +354,7 @@ def reco_card(r, chg=None, spark=None, gamma=None):
         return ((f'<div class="contract"><b>{escape(title)}</b></div>' if title else "")
                 + f'<div class="contract"><b>{escape(r["sym"])} {x["strike"]:g} {x["kind"]}</b>'
                 f'<span>{"exp " + escape(str(r.get("expiry"))) + " · " if r.get("expiry") else ""}Δ {x["delta"]:+.2f}'
+                f'{" · Upstox POP " + format(x["pop"], ".0f") + "%" if x.get("pop") is not None else ""}'
                 f'{" · model premium" if not x.get("live") else ""}</span></div>'
                 f'<div class="nums"><div class="num entry"><div class="l">Entry {escape(when)}</div>'
                 f'<div class="v">{_f(x["prem"])}</div><div class="p mut">premium</div></div>'
