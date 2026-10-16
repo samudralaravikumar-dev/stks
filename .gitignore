@@ -5,6 +5,7 @@ trading_signals_app (1).py
 trading_signals_app.backup.py
 data/
 github_login.bat
+push_updates.bat
 android/.gradle/
 android/build/
 android/app/build/
