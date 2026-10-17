@@ -4,14 +4,32 @@ Run:  run.bat   (or: .venv\\Scripts\\python -m streamlit run trading_signals_app
 Analysis lives in engine.py; paper trading & alerts in paper.py; background runner in runner.py.
 Educational tool only. NOT financial advice.
 """
+import os
 import re
+import sys
+import time
 from datetime import time as dtime
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 
 st.set_page_config(page_title="Intraday CALL/PUT Engine", layout="wide")
+_HERE = Path(__file__).resolve().parent
+
+
+def _local_modules():
+    return {n: m for n, m in list(sys.modules.items())
+            if getattr(m, "__file__", None) and Path(m.__file__).resolve().parent == _HERE}
+
+
+# Streamlit Cloud pulls new code into the running process and reruns only this script: helper modules (ui_kit,
+# engine, ...) imported earlier would stay the old version (AttributeError on anything new). If any of their files
+# changed since import, drop them all so the imports below load the new code together.
+if any(os.path.getmtime(m.__file__) > getattr(m, "_loaded_at", float("inf")) for m in _local_modules().values()):
+    for _n in _local_modules():
+        sys.modules.pop(_n, None)
 
 import engine as E  # noqa: E402
 import auth  # noqa: E402
@@ -21,6 +39,9 @@ import theme  # noqa: E402
 import ui_kit  # noqa: E402
 import symbols  # noqa: E402
 import upstox_feed  # noqa: E402
+
+for _m in _local_modules().values():
+    _m.__dict__.setdefault("_loaded_at", time.time())
 
 DEFAULT_WATCHLIST = "NIFTY, BANKNIFTY, FINNIFTY, RELIANCE, HDFCBANK, ICICIBANK, SBIN, INFY, TCS, LT, CRUDE, NATURALGAS"
 
