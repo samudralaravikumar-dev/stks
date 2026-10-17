@@ -117,7 +117,25 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private String savedUrl() {
-        return getSharedPreferences(PREFS, MODE_PRIVATE).getString(KEY_URL, "");
+        String url = getSharedPreferences(PREFS, MODE_PRIVATE).getString(KEY_URL, "");
+        if (url.isEmpty()) {  // first launch: use the portal address built into the app, if any
+            url = normalize(getString(R.string.default_url));
+            if (!url.isEmpty()) {
+                getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString(KEY_URL, url).apply();
+            }
+        }
+        return url;
+    }
+
+    private static String normalize(String url) {
+        url = url == null ? "" : url.trim();
+        if (!url.isEmpty() && !url.startsWith("http")) {
+            url = "https://" + url;
+        }
+        if (url.startsWith("http://")) {
+            url = "https://" + url.substring(7);   // portal must be served over HTTPS
+        }
+        return url;
     }
 
     private void loadPortal() {
@@ -156,13 +174,7 @@ public class MainActivity extends AppCompatActivity {
                 .setView(box)
                 .setCancelable(cancellable)
                 .setPositiveButton(R.string.open, (d, w) -> {
-                    String url = input.getText().toString().trim();
-                    if (!url.isEmpty() && !url.startsWith("http")) {
-                        url = "https://" + url;
-                    }
-                    if (url.startsWith("http://")) {
-                        url = "https://" + url.substring(7);   // portal must be served over HTTPS
-                    }
+                    String url = normalize(input.getText().toString());
                     SharedPreferences.Editor e = getSharedPreferences(PREFS, MODE_PRIVATE).edit();
                     e.putString(KEY_URL, url).apply();
                     loadPortal();

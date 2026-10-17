@@ -4,6 +4,11 @@ plugins {
 
 // Every CI build gets a higher versionCode, so Android installs a new APK as an update (local builds: 1)
 def buildNumber = (System.getenv("GITHUB_RUN_NUMBER") ?: "1").toInteger()
+// Portal address built into the app, so it opens straight away (no typing). Set it in DEFAULT_PORTAL_URL below,
+// or without editing code as the GitHub repository variable PORTAL_URL (Settings -> Secrets and variables ->
+// Actions -> Variables), which CI passes in as an environment variable. It can still be changed in the app.
+def DEFAULT_PORTAL_URL = ""
+def portalUrl = (System.getenv("PORTAL_URL") ?: DEFAULT_PORTAL_URL).trim()
 
 android {
     namespace "com.srk.tradingportal"
@@ -15,6 +20,7 @@ android {
         targetSdk 34
         versionCode buildNumber
         versionName "1.1.${buildNumber}"
+        resValue "string", "default_url", portalUrl
     }
 
     // One private key for every build (env vars set by CI from GitHub secrets; the key file is never committed).

@@ -58,6 +58,8 @@ jobs:
 
       - name: Build APK
         working-directory: android
+        env:
+          PORTAL_URL: ${{ vars.PORTAL_URL }}  # optional repository variable: the portal address built into the app
         run: |
           chmod +x gradlew
           ./gradlew assembleRelease --no-daemon --stacktrace
