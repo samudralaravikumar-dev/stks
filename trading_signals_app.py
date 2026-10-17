@@ -683,7 +683,13 @@ def simple_view():
             if not any(s == focus for s, _, _ in live):
                 st.info(f"🔔 {focus}: no active call right now (it may have been taken off or expired).")
         if live:
+            try:
+                import deals
+                dl = {s: deals.line(s) for s in {s for s, _, _ in live}}  # NSE bulk/block deals: context only
+            except Exception:
+                dl = {}
             for s, r, d in live:
+                r = dict(r, deals_line=dl.get(s, ""))
                 ring = ' style="outline:2px solid #ffb400;outline-offset:2px;border-radius:16px"' if s == focus else ""
                 st.html(f'<div class="tk"><div{ring}>' + ui_kit.call_card(s, r, view, d) + '</div></div>')
                 if r.get("strike") or view == "Futures":  # tap the copy icon, paste into the broker's search
