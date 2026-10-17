@@ -14,11 +14,11 @@ from math import erf, exp, log, pi, sqrt
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-import requests
 import streamlit as st
 import yfinance as yf
 
 import engine as E
+import net
 
 UP, DN, MUT, ACC = "#22c55e", "#ef4444", "#64748b", "#38bdf8"
 GLOBAL = [("S&P 500 fut", "ES=F"), ("Nasdaq fut", "NQ=F"), ("Dow fut", "YM=F"), ("Nikkei 225", "^N225"),
@@ -173,13 +173,36 @@ def vix_rank():
         return None
 
 
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def _year_range(ticker):
+    v = E._flat(yf.Ticker(ticker).history(period="1y", interval="1d", auto_adjust=False))
+    lo, hi = float(v["Low"].dropna().min()), float(v["High"].dropna().max())
+    if not (np.isfinite(lo) and np.isfinite(hi) and 0 < lo <= hi):
+        raise ValueError("no 1y range")
+    return lo, hi
+
+
+_YR_FAIL = {}  # ticker -> time of the last failed fetch (retried after 10 min, not every fragment run)
+
+
+def year_range(ticker):
+    """-> (52-week low, high) from Yahoo daily bars (Ticker.history: thread-safe), cached 6h; None on failure.
+    Failures are cached for 10 minutes only, so a blocked call doesn't hide the row for 6h."""
+    import time
+    if not ticker or time.time() - _YR_FAIL.get(ticker, 0) < 600:
+        return None
+    try:
+        return _year_range(ticker)
+    except Exception:
+        _YR_FAIL[ticker] = time.time()
+        return None
+
+
 # ---------------- Market intelligence ----------------
 @st.cache_data(ttl=120, show_spinner=False)
 def nse_indices():
     try:
-        s = requests.Session()
-        s.get("https://www.nseindia.com/", headers=_H, timeout=8)
-        j = s.get("https://www.nseindia.com/api/allIndices", headers=_H, timeout=8).json()
+        j = net.nse_get("https://www.nseindia.com/api/allIndices", _H)
         df = pd.DataFrame(j["data"])
         for c in ("last", "percentChange", "perChange30d", "perChange365d", "pe", "advances", "declines"):
             df[c] = pd.to_numeric(df[c], errors="coerce")
@@ -193,7 +216,7 @@ def nifty50_list():
     for u in ("https://archives.nseindia.com/content/indices/ind_nifty50list.csv",
               "https://www.niftyindices.com/IndexConstituent/ind_nifty50list.csv"):
         try:
-            r = requests.get(u, headers=_H, timeout=10)
+            r = net.session().get(u, headers=_H, timeout=10)
             if r.ok:
                 return pd.read_csv(io.StringIO(r.text))
         except Exception:
@@ -201,9 +224,39 @@ def nifty50_list():
     return None
 
 
+# Fallback when the NSE / niftyindices CSVs are blocked (cloud IPs). Index reviews: Mar & Sep; update twice a year.
+NIFTY50 = (("ADANIENT", "Metals & Mining"), ("ADANIPORTS", "Services"), ("APOLLOHOSP", "Healthcare"),
+           ("ASIANPAINT", "Consumer Durables"), ("AXISBANK", "Financial Services"), ("BSE", "Financial Services"),
+           ("BAJAJ-AUTO", "Automobile and Auto Components"), ("BAJFINANCE", "Financial Services"),
+           ("BAJAJFINSV", "Financial Services"), ("BEL", "Capital Goods"), ("BHARTIARTL", "Telecommunication"),
+           ("CIPLA", "Healthcare"), ("COALINDIA", "Oil Gas & Consumable Fuels"), ("DRREDDY", "Healthcare"),
+           ("EICHERMOT", "Automobile and Auto Components"), ("ETERNAL", "Consumer Services"),
+           ("GRASIM", "Construction Materials"), ("HCLTECH", "Information Technology"), ("HDFCBANK", "Financial Services"),
+           ("HDFCLIFE", "Financial Services"), ("HINDALCO", "Metals & Mining"), ("HINDUNILVR", "Fast Moving Consumer Goods"),
+           ("ICICIBANK", "Financial Services"), ("ITC", "Fast Moving Consumer Goods"), ("INFY", "Information Technology"),
+           ("INDIGO", "Services"), ("JSWSTEEL", "Metals & Mining"), ("JIOFIN", "Financial Services"),
+           ("KOTAKBANK", "Financial Services"), ("LT", "Construction"), ("M&M", "Automobile and Auto Components"),
+           ("MARUTI", "Automobile and Auto Components"), ("MAXHEALTH", "Healthcare"), ("NTPC", "Power"),
+           ("NESTLEIND", "Fast Moving Consumer Goods"), ("ONGC", "Oil Gas & Consumable Fuels"), ("POWERGRID", "Power"),
+           ("RELIANCE", "Oil Gas & Consumable Fuels"), ("SBILIFE", "Financial Services"), ("SHRIRAMFIN", "Financial Services"),
+           ("SBIN", "Financial Services"), ("SUNPHARMA", "Healthcare"), ("TCS", "Information Technology"),
+           ("TATACONSUM", "Fast Moving Consumer Goods"), ("TMPV", "Automobile and Auto Components"),
+           ("TATASTEEL", "Metals & Mining"), ("TECHM", "Information Technology"), ("TITAN", "Consumer Durables"),
+           ("TRENT", "Consumer Services"), ("ULTRACEMCO", "Construction Materials"))
+
+
+def nifty50_constituents():
+    """NIFTY 50 Symbol / Industry / Company Name: the NSE list (24h cache), else the NIFTY50 fallback above."""
+    lst = nifty50_list()
+    if lst is not None and {"Symbol", "Industry"} <= set(lst.columns) and len(lst):
+        return lst if "Company Name" in lst else lst.assign(**{"Company Name": lst.Symbol})
+    df = pd.DataFrame(NIFTY50, columns=["Symbol", "Industry"])
+    return df.assign(**{"Company Name": df.Symbol})
+
+
 @st.cache_data(ttl=120, show_spinner=False)
 def nifty50_moves():
-    lst = nifty50_list()
+    lst = nifty50_constituents()
     if lst is None:
         return None
     tick = [f"{s}.NS" for s in lst.Symbol]

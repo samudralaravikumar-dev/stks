@@ -23,14 +23,63 @@ import upstox_feed  # noqa: E402
 DEFAULT_WATCHLIST = "NIFTY, BANKNIFTY, FINNIFTY, RELIANCE, HDFCBANK, ICICIBANK, SBIN, INFY, TCS, LT, CRUDE, NATURALGAS"
 
 
+def _conservative():
+    st.session_state.update(risk_pct=0.25, daily_loss_pct=0.75, max_open=2)
+
+
 def wl_list():
     return list(dict.fromkeys(s.strip().upper() for s in st.session_state.get("wl_text", "").split(",") if s.strip()))
 
 
 def save_watchlist():
+    """Save the active list: the legacy watchlists row (SYMBOLS at login) and its numbered slot (sidebar, ⭐, N50, Home)."""
     u = st.session_state.get("user")
     if u:
         st.session_state["wl_text"] = ", ".join(auth.set_watchlist(u["username"], wl_list()))
+        auth.set_watchlist_slot(u["username"], st.session_state.get("wl_slot", 1), wl_list())
+
+
+def wl_switch_slot():
+    """Home 'List 1-5' callback: park the current list in its slot, load the new slot into wl_text (the sidebar widget
+    key, so callback only; empty slot 1 = DEFAULT_WATCHLIST), save it as the active list and ask home_tab for one
+    full rerun (sidebar, SYMBOLS and the scan follow the new list)."""
+    ss, u = st.session_state, st.session_state.get("user")
+    old, new = ss.get("wl_slot", 1), ss.get("home_wl_slot")
+    if new is None or new == old or not u:  # required control: None only if deselected somehow; keep the old slot
+        return
+    auth.set_watchlist_slot(u["username"], old, wl_list())
+    syms = (auth.get_watchlist_sets(u["username"]).get(new) or {}).get("symbols") or []
+    ss["wl_slot"] = new  # before save_watchlist, which writes the active slot
+    ss["wl_text"] = ", ".join(syms) if syms or new != 1 else DEFAULT_WATCHLIST
+    save_watchlist()
+    for k in ("last_results", "home_sel", "home_peek"):
+        ss.pop(k, None)
+    ss["wl_slot_note"] = ss["home_full_rerun"] = True
+
+
+def _wl_rename():
+    """Home '✎' popover Save: name the active slot ('' resets it to 'Watchlist n')."""
+    u = st.session_state.get("user")
+    if u:
+        auth.set_watchlist_slot(u["username"], st.session_state.get("wl_slot", 1), wl_list(),
+                                st.session_state.get("wl_slot_name") or "")
+
+
+def wl_add_sym(sym):
+    """'+ Add {sym} to watchlist' for a symbol opened from Movers (writes wl_text: callback only)."""
+    ss = st.session_state
+    if sym in wl_list():
+        ss.pop("home_peek", None)
+    elif len(wl_list()) >= 40:
+        ss["wl_flash"] = "Watchlist is full (40): remove one first"
+        return
+    else:
+        ss["wl_text"] = ", ".join(wl_list() + [sym])
+        save_watchlist()
+        ss["wl_flash"] = f"Added {sym}"
+        ss.pop("home_peek", None)
+    ss["home_sel"] = sym
+    ss["home_full_rerun"] = True
 
 
 def wl_add_one():
@@ -52,18 +101,66 @@ def wl_add_from(key):
 
 
 def wl_quick_add():
-    picks = st.session_state.get("wl_quick") or []
+    wl_add_many("wl_quick")
+
+
+def wl_add_many(key):
+    """Multiselect + button callback (wl_text is a sidebar widget key: only write it from callbacks)."""
+    picks = st.session_state.get(key) or []
     if picks:
         st.session_state["wl_text"] = ", ".join(dict.fromkeys(wl_list() + list(picks)))
         save_watchlist()
         st.session_state["wl_flash"] = "Added " + ", ".join(picks)
-    st.session_state["wl_quick"] = []
+    st.session_state[key] = []
 
 
 def wl_delete(sym):
     st.session_state["wl_text"] = ", ".join(s for s in wl_list() if s != sym)
     save_watchlist()
     st.session_state["wl_flash"] = f"Removed {sym}"
+
+
+def _home_remove(sym):
+    """Home '✕ Remove' callback: drop the symbol, then ask home_tab for one full rerun (sidebar + scan list)."""
+    wl_delete(sym)
+    st.session_state.pop("home_sel", None)
+    st.session_state["home_full_rerun"] = True
+
+
+def _wl_pick():
+    """Home watchlist on_select callback: open the clicked row (display order kept in home_wl_order)."""
+    ev = st.session_state.get(st.session_state.get("home_wl_key", "home_wl")) or {}
+    rows = (ev.get("selection") or {}).get("rows") or []
+    order = st.session_state.get("home_wl_order") or []
+    if rows and rows[0] < len(order):
+        st.session_state["home_sel"] = order[rows[0]]
+        st.session_state["home_peek"] = False  # back to normal watchlist behaviour
+
+
+def _mv_pick():
+    """Home Movers on_select callback: open the clicked NIFTY 50 stock; one outside the watchlist is 'peeked'."""
+    ev = st.session_state.get(st.session_state.get("home_mv_key", "home_mv")) or {}
+    rows = (ev.get("selection") or {}).get("rows") or []
+    order = st.session_state.get("home_mv_order") or []
+    if rows and rows[0] < len(order):
+        st.session_state["home_sel"] = order[rows[0]]
+        st.session_state["home_peek"] = order[rows[0]] not in wl_list()
+
+
+def _paper_exit(tid):
+    """Home Positions 'Exit (paper)' callback (admins only: the journal is shared). Closes one paper trade at its
+    current premium via paper.close_trade; no broker order is ever placed. The toast shows on the next run."""
+    if (st.session_state.get("user") or {}).get("role") != "admin":
+        return
+    r = paper.close_trade(tid, st.session_state.get("last_results") or {}, pd.Timestamp.now(tz=E.IST))
+    if r:  # toasted via pos_flash, not the alert diff; a close by someone else keeps its own (stop/target) toast
+        st.session_state.setdefault("notif_own", set()).add(f"exit:{int(tid)}")
+    st.session_state["pos_flash"] = f"Paper exit · {r['text']}" if r else "That paper trade was already closed."
+
+
+def _notif_read():
+    """'Mark all read' callback: everything logged so far counts as seen."""
+    st.session_state["notif_seen_id"] = paper.last_alert_id()
 
 
 def wl_clear():
@@ -207,6 +304,10 @@ with st.sidebar:
         if "wl_text" not in st.session_state:
             saved = auth.get_watchlist(user["username"])
             st.session_state["wl_text"] = ", ".join(saved) if saved else DEFAULT_WATCHLIST
+        if "wl_slot" not in st.session_state:  # numbered lists 1-5: active = the slot holding the saved list, else 1
+            _sets = auth.get_watchlist_sets(user["username"])
+            st.session_state["wl_slot"] = next((k for k, v in sorted(_sets.items()) if v["symbols"]
+                                                and v["symbols"] == wl_list()), 1)
         names = st.text_area("Watchlist (comma separated)", key="wl_text", height=90, on_change=save_watchlist,
                              help="Saved to your account. Manage it with search in the ⭐ Watchlist tab.")
         c1, c2 = st.columns(2)
@@ -222,22 +323,37 @@ with st.sidebar:
         use_time = st.checkbox("NSE entry window", True)
         c1, c2 = st.columns(2)
         win_start = c1.time_input("From", dtime(9, 30), step=300)
-        win_end = c2.time_input("To", dtime(14, 45), step=300)
+        win_end = c2.time_input("To", dtime(11, 0), step=300,
+                                help="New entries only until this time (ICICI Direct's rule for stock calls). In a 41-symbol, "
+                                     "120-day option-priced test, stopping at 11:00 improved both the selection and the "
+                                     "unseen period (-1.5% -> -0.8% and +2.1% -> +2.9% of premium per trade), "
+                                     "win rate ~63%, with ~57% of the trades. Set 14:45 for more signals.")
         orb_cut = st.time_input("ORB valid until", dtime(13, 0), step=900)
+        ctx_filter = st.multiselect("Confirmation filters", list(E.CTX_FILTERS), list(E.CTX_DEFAULT),
+                                    format_func=E.CTX_FILTERS.get,
+                                    help="A CALL/PUT must agree with these (NIFTY itself and MCX skip them). In a 30-stock, "
+                                         "60-day back-test all three together cut the loss per trade from -0.065R to "
+                                         "-0.004R and lifted T1 hits 22% → 26%; the MACD check helped in both halves of a 120-day walk-forward test.")
     with st.expander("🛡 Risk & options"):
         capital = st.number_input("Capital (₹)", 10000, 100000000, 200000, 10000)
-        risk_pct = st.slider("Risk per trade (% of capital)", 0.25, 3.0, 1.0, 0.25)
+        st.button("🛡 Conservative preset (0.25% · 0.75% · 2)", on_click=_conservative, use_container_width=True,
+                  help="Risk 0.25% per trade, stop for the day at -0.75%, at most 2 open positions")
+        risk_pct = st.slider("Risk per trade (% of capital)", 0.25, 3.0, 1.0, 0.25, key="risk_pct")
         strike_mode = st.selectbox("Strike selection", ["Delta target", "ATM", "1 step ITM", "2 steps ITM", "1 step OTM"])
         target_delta = st.slider("Target |delta|", 0.35, 0.80, 0.55, 0.05)
         exit_mode = st.selectbox("Exit after T1", ["2R target + flip", "Run to close"])
         rr = st.slider("Final target (R multiple)", 1.5, 4.0, 2.0, 0.5)
+        t1_r = st.select_slider("Book half at (R multiple)", [0.5, 0.75, 1.0], E.T1_R,
+                                help="T1: book 50% and move the stop to breakeven. 0.5R raised the win rate from ~47% to "
+                                     "~60% in an option-priced 120-day test with similar profit per trade; 1.0R wins less "
+                                     "often but lets more of each winner run.")
         stop_min = st.slider("Minimum stop (× ATR)", 0.5, 2.0, 0.75, 0.25)
         atr_mult = st.slider("Fallback stop (× ATR)", 0.75, 2.5, 1.5, 0.25)
         max_day = st.slider("Max trades per symbol per day", 1, 5, 2)
         st.markdown("**Portfolio risk guard**")
-        daily_loss_pct = st.slider("Daily loss limit (% of capital)", 1.0, 10.0, 3.0, 0.5,
+        daily_loss_pct = st.slider("Daily loss limit (% of capital)", 0.5, 10.0, 3.0, 0.25, key="daily_loss_pct",
                                    help="Paper trading stops opening trades for the day once hit")
-        max_open = st.slider("Max open positions", 1, 10, 4)
+        max_open = st.slider("Max open positions", 1, 10, 4, key="max_open")
         corr_guard = st.checkbox("Treat NIFTY / BANKNIFTY / FINNIFTY same-side trades as one bet", True)
         max_loss = st.slider("Max premium loss before exit", 0.2, 0.6, 0.35, 0.05)
         hold = st.slider("Expected hold (hours)", 0.25, 5.0, 1.0, 0.25)
@@ -251,7 +367,15 @@ with st.sidebar:
         use_news = st.checkbox("News sentiment", True)
     with st.expander("📒 Paper trading & alerts"):
         paper_on = st.toggle("Paper-trade every signal", True)
-        alerts_on = st.toggle("Send Telegram alerts", True)
+        alerts_on = st.toggle("Phone alerts (Telegram / ntfy)", True,
+                              help="New BUY CALL / BUY PUT signals and paper-trade events are pushed to your phone. "
+                                   "Set up: [ntfy] topic (ntfy app) and/or [telegram] in secrets.toml.")
+        alert_grade = st.select_slider("Alert on CALL/PUT graded", ["A", "B", "C", "D"], value="C",
+                                       format_func=lambda g: {"A": "A only", "B": "B or better", "C": "C or better",
+                                                              "D": "every signal"}[g],
+                                       help="Credibility grade a signal needs before it is pushed to your phone")
+        ch = [n for n, ok in (("Telegram", all(paper.telegram_creds())), ("ntfy", paper.ntfy_target()[1])) if ok]
+        st.caption("📲 Alerts go to: " + (", ".join(ch) if ch else "nowhere yet: add [ntfy] topic or [telegram] to secrets"))
     st.markdown("**🔄 Refresh**")
     c1, c2 = st.columns(2)
     auto = c1.toggle("Auto", False, help="Keep on during market hours so signals and paper trades update")
@@ -262,7 +386,7 @@ P = dict(interval=interval, period=period, th=th, adx_min=adx_min, lookback=look
          win_start=win_start, win_end=win_end, orb_cut=tmin(orb_cut), capital=capital, risk_pct=risk_pct,
          strike_mode=strike_mode, delta=target_delta, rr=rr, atr_mult=atr_mult, max_loss=max_loss, hold=hold,
          dte=dte, iv=iv_over, step=step_over, lot=lot_over, cost_pct=cost_pct, chain=use_chain, news=use_news,
-         setups=set(setups_on), exit_mode=exit_mode, stop_min=stop_min, max_day=max_day,
+         setups=set(setups_on), exit_mode=exit_mode, stop_min=stop_min, max_day=max_day, ctx_filter=tuple(ctx_filter), alert_grade=alert_grade, t1_r=t1_r,
          daily_loss_pct=daily_loss_pct, max_open=max_open, corr_guard=corr_guard)
 SYMBOLS = list(dict.fromkeys(s.strip().upper() for s in names.split(",") if s.strip()))
 
@@ -274,6 +398,9 @@ BADGE = {"BUY CALL (CE)": ("BUY CALL ▲", "green"), "BUY PUT (PE)": ("BUY PUT �
          "NO TRADE": ("NO TRADE", "gray")}
 
 
+ALERT_ICON = {"ENTRY": "📥", "T1": "🟡", "EXIT": "📤", "BLOCKED": "⛔", "SIGNAL": "📣", "NEWS": "📰"}
+
+
 def pct(a, b):
     return f"{(a / b - 1) * 100:+.0f}%" if b else None
 
@@ -281,23 +408,37 @@ def pct(a, b):
 def run_scan(now):
     vix, vix_chg = last_close("^INDIAVIX")
     fx, _ = last_close("USDINR=X")
-    results = {}
     with st.spinner(f"Scanning {len(SYMBOLS)} symbols…"):
-        for sym in SYMBOLS:
-            try:
-                results[sym] = analyze_fast(sym, P, vix, fx, now)
-            except Exception as e:
-                results[sym] = dict(spec=resolve(sym), error=f"{type(e).__name__}: {e}")
+        results = E.analyze_many(SYMBOLS, P, vix, fx, now)
     st.session_state["last_results"] = results
     try:
-        paper.log_recs([(s, recommend(a, P)) for s, a in results.items() if "error" not in a], now, "watchlist")
+        recs = [(s, recommend(a, P)) for s, a in results.items() if "error" not in a]
+        paper.log_recs(recs, now, "watchlist")
+        paper.log_recs([(s, E.blocked_rec(a, P)) for s, a in results.items() if "error" not in a], now, "blocked")
+        paper.save_chain_snaps(results, now)  # option-chain history (IV rank / OI build-up research), every 15 min
+        if alerts_on:  # phone push (Telegram / ntfy) once per symbol/side/day for each CALL/PUT at the chosen grade
+            pushed = paper.push_signals(recs, now, alert_grade)
+            pushed += paper.push_horizons(SYMBOLS, now, alert_grade, fx)  # BTST / 2-day, pre-close window only
+            pushed += paper.push_news(SYMBOLS, now)  # NSE filings: order wins, buybacks, results… (context)
+            for key, sym, kind, text in pushed:
+                st.toast(text.split("\n")[0], icon=ALERT_ICON.get(kind, "📣"))
+                st.session_state.setdefault("notif_own", set()).add(key)
+                if key.startswith("sig:"):  # intraday CALL/PUT only (not BTST / 2-day): Home skips its flip toast
+                    st.session_state.setdefault("paper_syms", set()).add(sym)
     except Exception:
         pass
     st.session_state["scan_time"] = now
     st.session_state["vix"] = (vix, vix_chg, fx)
     if paper_on:
-        for _, _, kind, text in paper.notify(paper.paper_step(results, P, now), send=alerts_on):
-            st.toast(text, icon={"ENTRY": "📥", "T1": "🟡", "EXIT": "📤"}.get(kind))
+        before = paper.last_alert_id()
+        new = paper.notify(paper.paper_step(results, P, now), send=alerts_on)
+        for key, _, kind, text in new:
+            st.toast(text, icon=ALERT_ICON.get(kind))
+        if new:  # already toasted here: Home's alert diff must not toast them again
+            st.session_state.setdefault("notif_own", set()).update(k for k, _, _, _ in new)
+            st.session_state.setdefault("paper_syms", set()).update(s for _, s, k, _ in new if k in ("ENTRY", "BLOCKED"))
+            if st.session_state.get("notif_last_id", before) >= before:  # no unseen rows from others in between
+                st.session_state["notif_last_id"] = paper.last_alert_id()
     return results, vix, vix_chg
 
 
@@ -309,8 +450,7 @@ def header_strip(now, vix, vix_chg):
     today = now.date().isoformat()
     closed_today = tr[(tr.status == "CLOSED") & tr.exit_at.fillna("").str.startswith(today)]
     opn = tr[tr.status == "OPEN"]
-    unreal = float(np.where(opn.half == 1, (opn.half_p - opn.entry_p) * opn.qty / 2 + (opn.last_p - opn.entry_p) * opn.qty / 2,
-                            (opn.last_p - opn.entry_p) * opn.qty).sum()) if len(opn) else 0.0
+    unreal = float(paper.unrealized(opn).sum())
     m = st.columns(6)
     m[0].metric("NIFTY 50", f"{n:,.2f}" if n else "n/a", f"{n_chg * 100:+.2f}%" if n else None)
     m[1].metric("BANK NIFTY", f"{b:,.2f}" if b else "n/a", f"{b_chg * 100:+.2f}%" if b else None)
@@ -383,6 +523,21 @@ def _spark(a, n=26):
     return [float(x) for x in a["d"].Close.tail(n)] + [float(a["ltp"])]
 
 
+def credible_panel(results, key, recs=None):
+    """High-credibility CALL / PUT plans only (grade bar chosen by the user), with the evidence behind each."""
+    h1, h2 = st.columns([5, 2], vertical_alignment="bottom")
+    bar = h2.segmented_control("Credibility bar", ["A", "B", "C"], default="B", key=f"cred_bar_{key}",
+                               help="A: strong evidence · B: fair evidence, no hard failure · C: weak (unproven back-test, "
+                                    "illiquid contract or stale data allowed)") or "B"
+    good, near = E.credible_ideas(results, P, bar, recs)
+    with h1:
+        st.html(ui_kit.section(f"High-credibility calls & puts · grade {bar} or better · {len(good)}"))
+    st.html(ui_kit.credible_board(good, near, bar))
+    st.caption("Graded on back-test edge, T1 hit record, live track record, contract liquidity, reachability, premium "
+               "reward:risk, theta, IV vs realized, data freshness and events. T1 odds = back-test T1 hit rate shrunk toward "
+               "the model touch probability. Credible ≠ certain: size small and use the stop. Not financial advice.")
+
+
 def dashboard():
     now = pd.Timestamp.now(tz=IST)
     results, vix, vix_chg = run_scan(now)
@@ -401,8 +556,7 @@ def dashboard():
     closed = tr[tr.status == "CLOSED"]
     closed_today = closed[closed.exit_at.fillna("").str.startswith(today)]
     opn = tr[tr.status == "OPEN"]
-    unreal = float(np.where(opn.half == 1, (opn.half_p - opn.entry_p) * opn.qty / 2 + (opn.last_p - opn.entry_p) * opn.qty / 2,
-                            (opn.last_p - opn.entry_p) * opn.qty).sum()) if len(opn) else 0.0
+    unreal = float(paper.unrealized(opn).sum())
     ideas = sorted([(s, a) for s, a in ok.items() if a["plan"]], key=lambda x: -x[1]["conf"])
     bull = sum(a["row"].Score >= a["row"].Need for a in ok.values())
     bear = sum(a["row"].Score <= -a["row"].Need for a in ok.values())
@@ -417,6 +571,7 @@ def dashboard():
     if evs:
         txt = " · ".join(f"**{s}**: {t.split(':')[0]}" for s, _, t in (hi or evs)[:6])
         (st.warning if hi else st.info)(f"📅 Events this week · {txt}")
+    credible_panel(ok, "sb")
     st.html(ui_kit.section(f"Trade ideas · {len(ideas)}"))
     st.html(ui_kit.ideas_grid([ui_kit.idea_card(s, a, _chg(a), ui_kit.sparkline(_spark(a))) for s, a in ideas]))
     rest = sorted([(s, a) for s, a in ok.items() if not a["plan"]], key=lambda x: -abs(x[1]["row"].Score))
@@ -585,6 +740,23 @@ def analysis_tab():
             st.line_chart(t.set_index("exit_time").R.cumsum().rename("Cumulative R"))
             st.dataframe(t, width="stretch", hide_index=True)
             st.caption("R = multiples of the initial underlying risk after costs; underlying move only (no theta/IV).")
+        ot, os_ = a.get("obt_trades"), a.get("obt")
+        st.markdown("**Same signals priced as options**")
+        if not os_:
+            st.info("No option-priced trades (or only expiry-day trades) in this history.")
+        else:
+            k = st.columns(5)
+            k[0].metric("Option trades", os_["trades"])
+            k[1].metric("Winners", f"{os_['win'] * 100:.0f}%")
+            k[2].metric("Avg per trade", f"{os_['avg'] * 100:+.1f}% of premium")
+            k[3].metric("Profit factor", f"{os_['pf']:.2f}")
+            k[4].metric("T1 reached", f"{os_['t1'] * 100:.0f}%")
+            st.dataframe(ot, width="stretch", hide_index=True,
+                         column_config={"iv": st.column_config.NumberColumn("IV", format="%.2f"),
+                                        "pnl_pct": st.column_config.NumberColumn("P&L % of premium", format="%+.2f")})
+            st.caption("Black-Scholes model: delta-0.55 strike, IV = 5-day realized vol × 1.3 held constant, next weekly/"
+                       "monthly expiry, 1.5% round-trip cost. Trades under a day to expiry are listed but left out of the "
+                       "statistics because the model overstates expiry-day gains. A model, not real option fills.")
 
 
 def users_tab():
@@ -837,8 +1009,7 @@ def paper_tab(symbols):
     st.subheader(f"Open paper positions ({len(opn)})")
     if len(opn):
         o = opn.copy()
-        o["Unrealized ₹"] = np.where(o.half == 1, (o.half_p - o.entry_p) * o.qty / 2 + (o.last_p - o.entry_p) * o.qty / 2,
-                                     (o.last_p - o.entry_p) * o.qty).round(0)
+        o["Unrealized ₹"] = paper.unrealized(o).round(0)
         st.dataframe(o[["symbol", "kind", "strike", "expiry", "qty", "entry_p", "last_p", "sl_p", "t1_p", "t2_p", "half",
                         "Unrealized ₹", "entry_u", "last_u", "setup", "conf", "priced", "opened_at", "updated_at"]],
                      hide_index=True, width="stretch")
@@ -875,16 +1046,19 @@ def paper_tab(symbols):
     st.subheader("Alert log")
     al = paper.alerts_df()
     if len(al):
-        st.dataframe(al, hide_index=True, width="stretch")
+        st.dataframe(al.drop(columns="id"), hide_index=True, width="stretch")
     else:
         st.caption("No alerts yet.")
     with st.expander("Danger zone"):
-        if st.button("Close all open paper trades now"):
-            n = paper.close_all(st.session_state.get("last_results", {}), pd.Timestamp.now(tz=IST))
-            st.success(f"Closed {n} trade(s).")
-        if st.checkbox("I understand this deletes the whole paper journal") and st.button("Reset journal"):
-            paper.reset_journal()
-            st.success("Journal cleared.")
+        if user["role"] != "admin":  # same gate as Home's paper exit: the journal is shared by every user
+            st.caption("Paper journal is shared; only admins can close or reset paper trades.")
+        else:
+            if st.button("Close all open paper trades now"):
+                n = paper.close_all(st.session_state.get("last_results", {}), pd.Timestamp.now(tz=IST))
+                st.success(f"Closed {n} trade(s).")
+            if st.checkbox("I understand this deletes the whole paper journal") and st.button("Reset journal"):
+                paper.reset_journal()
+                st.success("Journal cleared.")
 
 
 def _get_analysis(sym):
@@ -949,6 +1123,171 @@ def quick_tab():
                        + (f" + {a['chain']['source']} chain" if a["chain"] else ""))
     st.caption("Recommendations follow the engine's rules, which have no proven edge yet: size small, always use the stop, "
                "book 50% at T1. Model premiums are estimates; confirm on your broker's option chain. Not financial advice.")
+
+
+def horizons_tab():
+    """BTST and 2-day swing calls from daily candles, each graded on its own 2-year record on that symbol."""
+    import horizons as H
+    syms = [s for s in wl_list() if resolve(s)["kind"] != "commodity"] + \
+           [s for s in wl_list() if resolve(s)["kind"] == "commodity"]
+    if not syms:
+        st.info("Add symbols to your watchlist first.")
+        return
+    fx = st.session_state.get("vix", (None, None, None))[2] or last_close("USDINR=X")[0]
+    st.caption("**BTST**: strong close (CLV ≥ 0.75) through yesterday's high, daily EMA20 > EMA50, volume ≥ 1.2× average, "
+               "leading NIFTY; exit next session at +0.5 ATR or −0.75 ATR. **2-day swing**: daily EMA20 > EMA50, ADX > 20, "
+               "close above the 10-day high; exit within 2 sessions at ±1 ATR. **Pullback**: daily EMA20 > EMA50, yesterday dipped to "
+               "EMA20, today closes above yesterday's high with RSI 50–65; same exits. PUTs mirror. **2-day range** holds the next "
+               "2 sessions' move ~80% of the time (calibrated per symbol; 79% on unseen data for RELIANCE).")
+    with st.spinner("Loading daily history…"):
+        res = {s: H.analyze(s, fx if resolve(s)["kind"] == "commodity" else None) for s in syms}
+    rows = []
+    for s, a in res.items():
+        if a.get("error"):
+            rows.append({"Symbol": s, "BTST": "⚠ " + a["error"]})
+            continue
+        row = {"Symbol": s, "Close": a["close"], "2-day low": a["range2d"][0], "2-day high": a["range2d"][1],
+               "CLV": a["clv"], "ADX": a["adx"], "Vol ×": a["volx"], "RS vs NIFTY %": a["rs"]}
+        for kind, lbl in (("BTST", "BTST"), ("SWING2D", "2-day"), ("SWINGPB", "Pullback")):
+            x = a["setups"][kind]
+            g, why = H.grade(x["rec"])
+            if x["dir"]:
+                row[lbl] = f"{'▲ BUY CALL' if x['dir'] > 0 else '▼ BUY PUT'} · grade {g}"
+                row[f"{lbl} T1 / SL"] = f"{x['t1']:,.2f} / {x['sl']:,.2f}"
+                row[f"{lbl} record"] = why
+            else:
+                row[lbl] = "–"
+                rec = x["rec"]
+                row[f"{lbl} record"] = (f"no setup today · {rec['n_all']} past, {rec['hit_all'] * 100:.0f}% hit T1"
+                                        if rec["n_all"] else "no setup today")
+        a2 = st.session_state.get("last_results", {}).get(s)
+        if a2 and "error" not in a2 and any(a["setups"][k]["dir"] for k in a["setups"]):
+            dr = next(a["setups"][k]["dir"] for k in ("BTST", "SWING2D", "SWINGPB") if a["setups"][k]["dir"])
+            side = a2["sa"]["sides"]["CE" if dr > 0 else "PE"]
+            row["Option idea"] = f"{side['strike']:g} {'CE' if dr > 0 else 'PE'} @ {side['prem']:.2f}" + \
+                ("" if side["live"] else " (model)")
+        rows.append(row)
+    df = pd.DataFrame(rows)
+    num = st.column_config.NumberColumn
+
+    def color(v):
+        v = str(v)
+        return ("color:#4caf50;font-weight:700" if "CALL" in v else "color:#ef5350;font-weight:700" if "PUT" in v else "")
+    cols = [c for c in ["Symbol", "Close", "BTST", "BTST T1 / SL", "BTST record", "2-day", "2-day T1 / SL", "2-day record",
+                        "Pullback", "Pullback T1 / SL", "Pullback record", "Option idea", "2-day low", "2-day high", "CLV", "ADX", "Vol ×", "RS vs NIFTY %"] if c in df.columns]
+    st.dataframe(df[cols].style.map(color, subset=[c for c in ("BTST", "2-day", "Pullback") if c in df.columns]), hide_index=True,
+                 width="stretch", column_config={"Close": num(format="%.2f"), "2-day low": num(format="%.2f"),
+                                                  "2-day high": num(format="%.2f"), "CLV": num(format="%.2f"),
+                                                  "ADX": num(format="%.0f"), "Vol ×": num(format="%.2f"),
+                                                  "RS vs NIFTY %": num(format="%+.2f")})
+    with st.expander("How these setups did over 2 years (all your watchlist symbols pooled)"):
+        rec = H.portfolio_record(tuple(syms), fx)
+        for k, v in rec.items():
+            if v["n"]:
+                st.markdown(f"**{dict(BTST='BTST', SWING2D='2-day breakout swing', SWINGPB='2-day pullback swing')[k]}**: {v['n']} signals, T1 hit {v['hit'] * 100:.0f}%, "
+                            f"average {v['avg_r']:+.2f}R per trade · "
+                            + " · ".join(f"{s} {n} signals, {h * 100:.0f}% hit, {a_:+.2f}R" for s, (n, h, a_) in v["by_side"].items()))
+        st.caption("Across 30 NSE stocks these rules averaged about −0.03R (BTST) and −0.06R (2-day) over 2 years, and MCX "
+                   "about −0.2R: no proven edge overall, so each call is graded on its own symbol's record and only "
+                   "grade A/B setups are worth acting on.")
+    st.caption("BTST uses today's live daily candle: final after ~15:15 IST (MCX ~23:00). Overnight gaps can jump past a stop. "
+               "MCX daily levels come from NYMEX × USD/INR and are approximate. Educational, not financial advice.")
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _results_rows(items, src_key, _now):
+    """Assess each upcoming result (history + implied move); cached 5 min per data source."""
+    import results as R
+    out = []
+    for sym, rdate in items:
+        h, imp = R.history(sym), R.implied(sym, rdate, _now)
+        v, why = R.verdict(h, imp)
+        R.log(sym, rdate, imp, h, v, _now)
+        out.append((sym, rdate, h, imp, v, why))
+    return out
+
+
+def results_tab():
+    """Upcoming results: is the ATM straddle cheap or rich versus the stock's own results-day history?"""
+    import results as R
+    now = pd.Timestamp.now(tz=IST)
+    lst = pro.nifty50_list()
+    uni = set(s.strip().upper() for s in E.FNO_STOCKS.split(",")) | set(wl_list()) | \
+        (set(lst.Symbol) if lst is not None else set())
+    st.caption("Before results, direction is a coin flip (the 5-day pre-results drift matched the reaction 45% of the time) "
+               "and option premiums collapse after the announcement (IV crush). The one pre-results bet that suits an option "
+               "buyer is a **long straddle (ATM CALL + PUT) when it is cheap**: its cost, the break-even move, is below the "
+               "move this stock has usually made on results. **Rich** straddles usually lose to IV crush: avoid buying "
+               "options into those results.")
+    days = st.segmented_control("Window", [3, 7, 14], default=7, format_func=lambda d: f"next {d} days",
+                                key="res_days") or 7
+    up = R.upcoming(uni, now, days)
+    if up.empty:
+        st.info("No results for F&O / NIFTY 50 stocks in this window (or the NSE event calendar is unreachable).")
+    else:
+        items = tuple((r.symbol, r.date) for r in up.head(30).itertuples())
+        src = "upstox" if E.UPSTOX else "nse"
+        with st.spinner(f"Pricing {len(items)} results straddles…"):
+            rows = _results_rows(items, src, now.floor("5min"))
+        tag = {"cheap": "🟢 cheap: straddle candidate", "rich": "🔴 rich: avoid (IV crush)", "fair": "🟡 fair", "n/a": "–"}
+        tbl = [{"Symbol": s, "Results": d, "In days": (d - now.date()).days, "Verdict": tag[v],
+                "Break-even move %": imp["pct"] if imp else None, "Usual results move %": h.get("mean_pct"),
+                "Median %": h.get("median_pct"), ">2 ATR %": h.get("big2atr", 0) * 100 if h.get("n") else None,
+                "Past results": h.get("n", 0), "Straddle ₹": imp["straddle"] if imp else None,
+                "Per lot ₹": imp["straddle"] * imp["lot"] if imp and imp.get("lot") else None,
+                "Strike": imp["strike"] if imp else None, "Expiry": imp["expiry"] if imp else None, "Why": why}
+               for s, d, h, imp, v, why in rows]
+        df = pd.DataFrame(tbl)
+        num = st.column_config.NumberColumn
+
+        def col(v):
+            v = str(v)
+            return "color:#4caf50;font-weight:700" if "cheap" in v else "color:#ef5350;font-weight:700" if "rich" in v else ""
+        st.dataframe(df.style.map(col, subset=["Verdict"]), hide_index=True, width="stretch",
+                     column_config={"Break-even move %": num(format="%.1f"), "Usual results move %": num(format="%.1f"),
+                                    "Median %": num(format="%.1f"), ">2 ATR %": num(format="%.0f"),
+                                    "Straddle ₹": num(format="%.2f"), "Per lot ₹": num(format="₹%.0f"),
+                                    "Strike": num(format="%g")})
+        cheap = [r for r in rows if r[4] == "cheap" and (r[1] - now.date()).days <= 2]
+        if cheap and alerts_on:  # one phone alert per symbol/result for cheap straddles close to the date
+            ev = [(f"results:{s}:{d}", s, "SIGNAL",
+                   f"📅 RESULTS STRADDLE {s} ({d}): BUY {imp['strike']:g} CE + {imp['strike']:g} PE ({imp['expiry']}) "
+                   f"≈ ₹{imp['straddle']:.2f}\n{why}\nExit after the results reaction; premium collapses if the move is "
+                   f"small. Educational, not advice.") for s, d, h, imp, v, why in cheap]
+            for key, sym, kind, text in paper.notify(ev, send=True):
+                st.toast(text.split("\n")[0], icon="📅")
+        st.caption("Usual results move = average |close before announcement → close of the reaction session| over this "
+                   "stock's past results (NSE filings). Break-even = ATM straddle ÷ spot on the first expiry after the "
+                   "results date (Upstox live chain). Cheap ≥ 1.15×, rich ≤ 0.85×. A straddle still loses if the stock "
+                   "moves less than its break-even.")
+    rc = R.recent(uni, now)
+    if not rc.empty:
+        st.markdown("**Reported in the last few days**")
+        rr = []
+        for r in rc.head(15).itertuples():
+            h = R.history(r.symbol)
+            last = h["rows"].iloc[-1] if h.get("n") else None
+            rr.append({"Symbol": r.symbol, "Results": r.date,
+                       "Reaction %": float(last.move_pct) if last is not None and last.date.date() >= r.date else None,
+                       "Reaction (ATR)": float(last.move_atr) if last is not None and last.date.date() >= r.date else None})
+        st.dataframe(pd.DataFrame(rr), hide_index=True, width="stretch",
+                     column_config={"Reaction %": st.column_config.NumberColumn(format="%+.2f"),
+                                    "Reaction (ATR)": st.column_config.NumberColumn(format="%+.2f")})
+        st.caption("After results the IV premium is gone, so the normal intraday CALL/PUT signals apply again at fair "
+                   "premiums. Chasing the reaction for days showed no reliable edge here (66 reactions, 39 stocks).")
+    R.score_log(now)
+    lg = R.log_df()
+    with st.expander(f"Straddle track record · {int(lg.actual_pct.notna().sum())} scored of {len(lg)} logged"):
+        if lg.empty:
+            st.caption("Assessments are logged before each result and scored after it.")
+        else:
+            sc = lg[lg.actual_pct.notna()]
+            if len(sc):
+                for v, g in sc.groupby("verdict"):
+                    st.markdown(f"**{v}**: {len(g)} results, moved more than break-even "
+                                f"{(g.straddle_edge_pct > 0).mean() * 100:.0f}% of the time, average edge "
+                                f"{g.straddle_edge_pct.mean():+.2f}% of spot")
+            st.dataframe(lg.drop(columns=["id"]), hide_index=True, width="stretch")
 
 
 def options_tab():
@@ -1026,6 +1365,27 @@ def market_tab():
         g1.dataframe(moves.nlargest(5, "chg")[["Symbol", "Industry", "last", "chg"]].round(2), hide_index=True, width="stretch")
         g2.markdown("**Top NIFTY losers**")
         g2.dataframe(moves.nsmallest(5, "chg")[["Symbol", "Industry", "last", "chg"]].round(2), hide_index=True, width="stretch")
+    import news
+    st.html(ui_kit.section("Corporate catalysts · NSE filings, last 24 h"))
+    ann = news.announcements()
+    if ann.empty:
+        st.caption("NSE announcements feed unavailable right now.")
+    else:
+        fno = set(s.strip() for s in E.FNO_STOCKS.split(",")) | set(wl_list())
+        scope = st.segmented_control("Show", ["F&O + watchlist", "All companies"], default="F&O + watchlist",
+                                     key="mi_news_scope", label_visibility="collapsed") or "F&O + watchlist"
+        x = ann[ann.ts >= now - pd.Timedelta(hours=24)]
+        if scope == "F&O + watchlist":
+            x = x[x.symbol.isin(fno)]
+        if moves is not None and len(moves):
+            x = x.merge(moves[["Symbol", "chg"]].rename(columns={"Symbol": "symbol", "chg": "Day %"}), on="symbol", how="left")
+        st.dataframe(x.drop(columns=["alert"]).rename(columns={"ts": "Filed", "reading": "Usual"}), hide_index=True,
+                     width="stretch", column_config={"link": st.column_config.LinkColumn("Filing", display_text="PDF"),
+                                                     "Filed": st.column_config.DatetimeColumn(format="DD MMM HH:mm")})
+        st.caption("From NSE's announcements RSS (refreshed every 10 min). Order wins, acquisitions and buybacks usually "
+                   "read positive and fund raising negative, but evidence says news alone is not a reliable CALL/PUT "
+                   "signal in India: wait for price and volume to confirm. Alert-worthy filings on your watchlist are "
+                   "pushed to your phone.")
 
 
 def watchlist_tab():
@@ -1103,7 +1463,6 @@ def watchlist_tab():
 
 
 def nifty50_tab():
-    from concurrent.futures import ThreadPoolExecutor, as_completed
     lst = pro.nifty50_list()
     if lst is None or lst.empty:
         st.warning("NIFTY 50 constituents list is unavailable right now (NSE archive unreachable).")
@@ -1125,16 +1484,9 @@ def nifty50_tab():
             fx, _ = last_close("USDINR=X")
         Pn = dict(P, news=False)
         bar = st.progress(0.0, text="Scanning NIFTY 50…")
-        out, syms = {}, list(lst.Symbol)
-        with ThreadPoolExecutor(max_workers=6) as pool:
-            futs = {pool.submit(analyze_fast, s, Pn, vix, fx, now): s for s in syms}
-            for i, fu in enumerate(as_completed(futs), 1):
-                s = futs[fu]
-                try:
-                    out[s] = fu.result()
-                except Exception as e:
-                    out[s] = dict(error=f"{type(e).__name__}: {e}")
-                bar.progress(i / len(syms), text=f"Scanned {i}/{len(syms)} · {s}")
+        syms = list(lst.Symbol)
+        out = E.analyze_many(syms, Pn, vix, fx, now,
+                             progress=lambda i, n, s: bar.progress(i / n, text=f"Scanned {i}/{n} · {s}"))
         bar.empty()
         rows = []
         for s in syms:
@@ -1160,7 +1512,9 @@ def nifty50_tab():
                     f"after 15-min close {'above' if r['kind'] == 'CE' else 'below'} {r['u_entry']:,.2f}",
                     "Option": f"{r['strike']:g} {r['kind']}", "Entry ₹": r["prem"], "Stop ₹": r["sl"],
                     "Target 1 ₹": r["t1"], "Target 2 ₹": r["t2"], "Stock target 1": r["u_t1"], "Stock target 2": r["u_t2"],
-                    "Stock stop": r["u_sl"], "Confidence": r["conf"], "Event": ev})
+                    "Stock stop": r["u_sl"], "Confidence": r["conf"],
+                    "Credibility": f"{r['cred']['grade']} · {r['cred']['score']}", "T1 odds": round(r["cred"]["p_t1"] * 100),
+                    "Event": ev})
         paper.log_recs([(s, recommend(a, Pn)) for s, a in out.items() if "error" not in a], now, "nifty50")
         data = dict(rows=rows, time=now, src="Upstox" if E.UPSTOX else "Kite" if E.KITE is not None else "Yahoo/NSE")
         st.session_state["n50"] = data
@@ -1196,22 +1550,25 @@ def nifty50_tab():
                 "background-color:#334155;color:#e2e8f0" if s == "NO TRADE" else "")
     num = st.column_config.NumberColumn
     cols = [c for c in ["Symbol", "Trend", "LTP", "Day %", "Recommendation", "Plan", "Option", "Entry ₹", "Stop ₹",
-                        "Target 1 ₹", "Target 2 ₹", "Stock target 1", "Stock target 2", "Stock stop", "Confidence",
-                        "Score", "Event", "Industry", "Company"] if c in df.columns]
+                        "Target 1 ₹", "Target 2 ₹", "Stock target 1", "Stock target 2", "Stock stop", "Credibility",
+                        "T1 odds", "Confidence", "Score", "Event", "Industry", "Company"] if c in df.columns]
     st.dataframe(df[cols].style.map(color, subset=["Recommendation"]), hide_index=True, width="stretch",
                  height=min(80 + 35 * len(df), 1400),
                  column_config={"Trend": st.column_config.LineChartColumn("Trend", width="small"),
                                 "LTP": num(format="%.2f"), "Day %": num(format="%+.2f%%"), "Score": num(format="%+.1f"),
                                 **{c: num(format="%.2f") for c in ("Entry ₹", "Stop ₹", "Target 1 ₹", "Target 2 ₹",
                                                                    "Stock target 1", "Stock target 2", "Stock stop")},
+                                "T1 odds": num(format="%d%%", help="Back-test T1 hit rate shrunk toward the model "
+                                                                    "touch probability"),
+                                "Credibility": st.column_config.TextColumn(
+                                    help="A-D grade from back-test edge, live track record, contract liquidity, "
+                                         "reachability, reward:risk, theta, IV and data freshness"),
                                 "Confidence": st.column_config.ProgressColumn("Confidence", min_value=0, max_value=100,
                                                                               format="%d")})
     add = st.multiselect("⭐ Add to my watchlist", [s for s in df.Symbol if s not in wl_list()], key="n50_add",
                          placeholder="Pick stocks from this scan to track them in ⭐ Watchlist")
-    if add and st.button(f"Add {len(add)} to watchlist"):
-        st.session_state["wl_text"] = ", ".join(dict.fromkeys(wl_list() + add))
-        save_watchlist()
-        st.success("Added " + ", ".join(add))
+    if add:
+        st.button(f"Add {len(add)} to watchlist", key="n50_add_btn", on_click=wl_add_many, args=("n50_add",))
     st.caption("Sorted: enter-now ideas first, then trigger plans, then no trade; strongest score first. Entry/Stop/"
                "Target ₹ are option premiums; Stock target/stop are share-price levels. 📅 Event = results/expiry "
                "risk (avoid holding options into results). Not financial advice.")
@@ -1236,7 +1593,7 @@ def track_tab():
     period = c[1].segmented_control("Period", ["Today", "7 days", "30 days"], default="7 days", key="tr_period",
                                     label_visibility="collapsed")
     side = c[2].segmented_control("Side", ["All", "CALL", "PUT"], default="All", key="tr_side", label_visibility="collapsed")
-    mode = c[3].segmented_control("Type", ["All", "Enter now", "Trigger"], default="All", key="tr_mode",
+    mode = c[3].segmented_control("Type", ["All", "Enter now", "Trigger", "Blocked by filters", "Broker calls"], default="All", key="tr_mode",
                                   label_visibility="collapsed")
     last = st.session_state.get("tr_eval")
     if run or last is None or (now - last).total_seconds() > 300:
@@ -1253,6 +1610,36 @@ def track_tab():
         df = df[df["mode"] == "now"]
     elif mode == "Trigger":
         df = df[df["mode"] == "trigger"]
+    elif mode == "Blocked by filters":  # setups the confirmation filters stopped: did the filters save money?
+        df = df[df["mode"] == "blocked"]
+        st.caption("Setups the confirmation filters blocked, scored as if they had been taken. If these do worse than "
+                   "'Enter now', the filters are earning their keep.")
+    elif mode == "Broker calls":  # external calls you entered below, judged with the same rules
+        df = df[df["mode"].str.startswith("broker")]
+    else:
+        df = df[~df["mode"].isin(["blocked"]) & ~df["mode"].str.startswith("broker")]
+    with st.expander("➕ Track a broker / TV intraday call (check its real accuracy)"):
+        with st.form("broker_call", clear_on_submit=True):
+            f = st.columns([2, 1, 1, 1, 1, 1, 2])
+            b_sym = f[0].text_input("Stock", placeholder="e.g. DABUR")
+            b_side = f[1].selectbox("Side", ["BUY", "SELL"])
+            b_entry = f[2].number_input("Entry", min_value=0.0, step=0.05, format="%.2f")
+            b_sl = f[3].number_input("Stop", min_value=0.0, step=0.05, format="%.2f")
+            b_t1 = f[4].number_input("Target 1", min_value=0.0, step=0.05, format="%.2f")
+            b_t2 = f[5].number_input("Target 2 (opt.)", min_value=0.0, step=0.05, format="%.2f")
+            b_src = f[6].text_input("Source", placeholder="ICICI Momentum Pick / TV show…")
+            if st.form_submit_button("Track this call", type="primary"):
+                ok_dir = (b_sl < b_entry < b_t1) if b_side == "BUY" else (b_t1 < b_entry < b_sl)
+                if not b_sym or not b_entry or not ok_dir:
+                    st.error("Need stock, entry, stop and target with stop and target on opposite sides of the entry.")
+                elif paper.add_broker_call(symbols.to_symbol(b_sym) or b_sym, b_side, b_entry, b_sl, b_t1,
+                                           b_t2 or b_t1, b_src, now):
+                    st.success(f"Tracking {b_side} {b_sym.upper()} from {b_src or 'unnamed'}: see Type → Broker calls.")
+                else:
+                    st.warning("Already tracking that call today.")
+        st.caption("Judged on live 5-min prices with ICICI Direct's own rules: entered only if price trades within ±0.25% "
+                   "of the entry (otherwise 'not triggered', like their 'not initiated'), then stop vs target within the "
+                   "same session. Intraday calls only. Over a few weeks this shows each source's real hit rate.")
     if df.empty:
         st.info("No recommendations logged for this filter yet. They are recorded automatically as the dashboard, "
                 "NIFTY 50 scan and stock search show BUY CALL / BUY PUT ideas.")
@@ -1285,7 +1672,7 @@ def track_tab():
         st.plotly_chart(fig, width="stretch", key="tr_fig")
     with g2:
         grp = df.assign(win=win, loss=loss, side=df.kind.map({"CE": "CALL", "PE": "PUT"}),
-                        type=df["mode"].map({"now": "Enter now", "trigger": "Trigger"}))
+                        type=df["mode"].map(lambda m: {"now": "Enter now", "trigger": "Trigger", "blocked": "Blocked"}.get(m, m.replace("broker:", "Broker: "))))
         summ = grp.groupby(["side", "type"]).agg(ideas=("id", "count"), succeeded=("win", "sum"), failed=("loss", "sum"),
                                                  avg_R=("r_mult", "mean")).reset_index()
         summ["success_rate"] = (summ.succeeded / (summ.succeeded + summ.failed).replace(0, np.nan) * 100).round(0)
@@ -1333,16 +1720,515 @@ def _pc(ltp, ch):
     return (ch / prev * 100) if prev else None
 
 
+def _oc_reads(chain, spot, w):
+    """Strike -> OI read text from engine.oi_table (the chain table's strike tooltips)."""
+    try:
+        df = oi_table(chain, spot, width=w)
+        return {float(s.split(" ")[0]): rd for s, rd in zip(df.Strike, df.Read)}
+    except Exception:
+        return {}
+
+
+def _home_oa(sel, a, spot, now):
+    """pro.options_analytics at the chain's live spot for the chips, memoised per symbol, chain object, minute and 0.1%
+    spot bucket (GEX grid is slow-ish); the expected range is then re-centred on the exact spot."""
+    key = (sel, id(a.get("chain")), now.floor("min"), round(float(np.log(spot)) * 1000) if spot and spot > 0 else None)
+    hit = st.session_state.get("home_oa")
+    if hit and hit[0] == key:
+        o = hit[1]
+    else:
+        try:
+            o = pro.options_analytics(dict(a, ltp=spot) if spot and spot > 0 else a, P, now)
+        except Exception:
+            o = None
+        st.session_state["home_oa"] = (key, o)
+    if o and o.get("straddle") and spot and spot > 0:
+        o = dict(o, S=spot, em_lo=spot - o["straddle"], em_hi=spot + o["straddle"])
+    return o
+
+
+def _ev_cell(events):
+    """Watchlist 'Event' text from analysis['events']: the most severe symbol event ('⚠ Results tmrw' high,
+    '📅 Dividend 3d' info) or ''. Market-wide holidays are left to the quote header."""
+    ev = sorted([e for e in (events or []) if e and len(e) == 2 and "holiday" not in str(e[1]).lower()],
+                key=lambda e: e[0] != "high")
+    return f"{'⚠' if ev[0][0] == 'high' else '📅'} {ui_kit.event_short(ev[0][1])}" if ev else ""
+
+
+def _mkt_open(sess, now):
+    """E.SESSIONS window on a weekday (exchange holidays are not checked)."""
+    op, cl, _ = E.SESSIONS[sess]
+    return now.weekday() < 5 and op <= now.time() < cl
+
+
+def _mkt_status(now):
+    """Index-strip market pill: NSE and MCX (approximate: some MCX contracts trade to 23:55) from E.SESSIONS."""
+    hm = lambda s: "-".join(t.strftime("%H:%M") for t in E.SESSIONS[s][:2])
+    return [("NSE", _mkt_open("nse", now), f"Weekdays {hm('nse')} IST (exchange holidays not checked)"),
+            ("MCX", _mkt_open("mcx", now), f"≈ weekdays {hm('mcx')} IST; hours vary by contract (some to 23:55)")]
+
+
+def _ago(mins):
+    m = max(int(mins), 0)
+    return ("just now" if m < 1 else f"{m} min ago" if m < 60 else f"{m // 60}h {m % 60:02d}m ago" if m < 1440
+            else f"{m // 1440}d ago")
+
+
+def _fresh(a, v, now):
+    """Quote-header freshness: the last tick (Upstox last_trade_time) else the last closed candle, its age and the data
+    sources. cls 'w' (amber) when stale while the symbol's market is open, 'ok' when fresh, '' when closed."""
+    ts = None
+    try:
+        if v and v.get("last_trade_time"):
+            ts = pd.Timestamp(int(v["last_trade_time"]), unit="ms", tz="UTC").tz_convert(IST)
+    except (TypeError, ValueError, OverflowError):
+        ts = None
+    tick, iv = ts is not None, int(P["interval"][:-1])
+    if not tick:
+        ts = a["row"].name + pd.Timedelta(minutes=iv)  # bars are stamped at their start; prepare() drops the forming one
+    age = (now - ts).total_seconds() / 60
+    live = _mkt_open(a["spec"]["sess"], now)
+    stale = live and age > (5 if tick else iv + 10)
+    when = (f"{ts:%d %b} " if ts.date() != now.date() else "") + (f"{ts:%H:%M:%S}" if tick else f"{ts:%H:%M}")
+    src = " · ".join(x for x in (f"{a.get('src') or '?'} candles", "Upstox quote" if v else None,
+                                 f"{a['chain']['source']} chain" if a.get("chain") else None) if x)
+    return dict(text=(f"Last tick {when}" if tick else f"{P['interval']} bar closed {when}") + f" · {_ago(age)} · {src}"
+                + ("" if live else " · market closed"), cls="w" if stale else "ok" if live else "",
+                tip="Data freshness: last traded tick (Upstox) or last closed candle, its age, and the candle / quote / "
+                    "option-chain sources" + (". Stale for an open market: check the feed." if stale else ""))
+
+
+def _ranges(a, v, ltp, exch):
+    """Inputs for ui_kit.range_bars -> (day_lo, day_hi, day_title, wk_lo, wk_hi, stats). Upstox quote: day OHLC,
+    average price, volume and OI; otherwise today's closed bars of a['d'] widened to include the LTP (the forming
+    candle is not in d) and row.VWAP / PDC. 52-week from Yahoo daily bars; skipped for MCX (Yahoo ticker is a USD
+    proxy)."""
+    d, row, spec, num = a["d"], a["row"], a["spec"], ui_kit._num
+    o, idx, now = (v or {}).get("ohlc") or {}, exch == "INDEX", pd.Timestamp.now(tz=IST)
+    lo, hi, op = num(o.get("low")), num(o.get("high")), num(o.get("open"))
+    td = d[d.index.date == d.index[-1].date()] if len(d) else d
+    try:  # session the range belongs to: the quote's last trade (Upstox), else today while the market is open, else
+        day = pd.Timestamp(int(v["last_trade_time"]), unit="ms", tz="UTC").tz_convert(IST).date()  # the last bar's day
+    except (TypeError, ValueError, KeyError, OverflowError):
+        day = now.date() if _mkt_open(spec["sess"], now) else td.index[-1].date() if len(td) else None
+    title = "Today's range" if day == now.date() else f"Day range ({day:%d %b})" if day else "Day range"
+    fresh_td = len(td) > 0 and td.index[-1].date() == day  # False early in a session: no closed bar of `day` yet
+    if not (lo and hi):  # Yahoo / Kite, or Upstox pre-open zeros; never mix yesterday's bars into today's range
+        lo = min(float(td.Low.min()), ltp) if fresh_td and ltp else None
+        hi = max(float(td.High.max()), ltp) if fresh_td and ltp else None
+        op = float(td.Open.iloc[0]) if fresh_td else None
+    avg = num((v or {}).get("average_price")) if not idx else None
+    avg = avg or (num(row.VWAP) if fresh_td else None)
+    prev = ((v["last_price"] - v["net_change"]) if v and v.get("net_change") is not None else num(row.PDC) if fresh_td
+            else float(d.Close.iloc[-1]) if len(d) else None)  # new session without bars: last close is prev. close
+    vol = None if idx else num(v.get("volume")) if v else (float(td.Volume.sum()) if a["has_vol"] and fresh_td else None)
+    oi = num((v or {}).get("oi"))
+    f = lambda x: None if num(x) is None else f"{num(x):,.2f}"
+    stats = [("Open", f(op)), ("Prev. close", f(prev)), ("VWAP" if a["has_vol"] else "Avg", f(avg)),
+             ("Volume", ui_kit._qty(vol) if vol else None), ("OI", ui_kit._qty(oi) if oi else None)]
+    wl_, wh = None, None
+    yr = pro.year_range(spec["ticker"]) if spec["kind"] != "commodity" else None
+    if yr and ltp and 0.7 * yr[0] <= ltp <= 1.3 * yr[1]:  # hide a mismatched / badly adjusted Yahoo series
+        wl_, wh = min(yr[0], lo or yr[0]), max(yr[1], hi or yr[1])  # Yahoo daily bars can lag today's range
+    return lo, hi, title, wl_, wh, stats
+
+
+CHART_OV = list(E.CHART_OVERLAYS) + ["Levels"]
+
+
+def _chart_levels(sel, a, r, spot, now):
+    """Home chart lines [(label, price, colour, dash[, note])] on the underlying: the plan (entry / trigger, SL, T1, T2;
+    both conditional triggers when there is no trade), an open paper trade (avg, stop, targets), the chain's OI walls
+    and max pain, and the straddle expected range."""
+    L = []
+    if r.get("mode") in ("now", "trigger"):
+        L += [("Entry" if r["mode"] == "now" else "Trigger", r.get("u_entry"), "#4184f3", "solid"),
+              ("SL", r.get("u_sl"), "#ef5350", "dash"), ("T1", r.get("u_t1"), "#4caf50", "dot"),
+              ("T2", r.get("u_t2"), "#4caf50", "dot")]
+    else:
+        alt = tuple(r.get("alt") or ()) + (None, None)
+        L += [(lbl, x.get("u_entry"), col, "dot") for x, lbl, col in ((alt[0], "CALL above", "#4caf50"),
+                                                                      (alt[1], "PUT below", "#ef5350")) if x]
+    try:
+        tr = paper.trades_df()
+        t = tr[(tr.status == "OPEN") & (tr.symbol == sel)]
+        pnl = paper.unrealized(t)
+    except Exception:
+        t, pnl = pd.DataFrame(), pd.Series(dtype=float)
+    for i, x in t.iterrows():
+        qty = (x.qty / 2 if x.half == 1 else x.qty) if pd.notna(x.qty) else None
+        p = pnl.get(i)
+        L.append(("Paper avg", x.entry_u, "#e6edf7", "solid", f"{x.kind} {_k(x.strike)} · "
+                  + (f"{qty:,.0f} × " if qty is not None else "") + (f"P&L ₹{p:,.0f}" if pd.notna(p) else "P&L n/a")))
+        L += [("Paper SL", x.stop_u, "#ef5350", "dashdot")] + \
+             ([("Paper T1", x.t1_u, "#4caf50", "dashdot")] if x.half != 1 else []) + [("Paper T2", x.t2_u, "#4caf50", "dashdot")]
+    ch = a.get("chain") or {}
+    L += [("Call wall", ch.get("call_wall"), "#ef9a9a", "dot"), ("Put wall", ch.get("put_wall"), "#a5d6a7", "dot"),
+          ("Max pain", ch.get("max_pain"), "#fbbf24", "dot")]
+    o = _home_oa(sel, a, spot, now) if ch.get("quotes") else None
+    if o:
+        L += [("Exp. low", o.get("em_lo"), "#94a3b8", "dot"), ("Exp. high", o.get("em_hi"), "#94a3b8", "dot")]
+    return [x for x in L if ui_kit._num(x[1]) is not None]
+
+
+def _home_chart(sel, a, r, spot, now):
+    """Home 'Chart' sub-tab: interval switch (chart only; signals stay on the sidebar interval), overlay pills,
+    Indicators toggle (off = compact price + volume, on = the full 980px stack), OHLC legend and level lines."""
+    ss = st.session_state
+    pf = ss.setdefault("home_ch_pref", {"iv": None, "ov": list(CHART_OV), "ind": False, "base": P["interval"]})
+    if pf["base"] != P["interval"]:  # sidebar interval changed: the chart follows it again
+        pf.update(iv=None, base=P["interval"])
+        ss.pop("home_iv", None)
+    c1, c2, c3 = st.columns([3, 5, 2], vertical_alignment="center")
+    pf["iv"] = c1.segmented_control("Interval", ["1m", "5m", "15m"], default=pf["iv"] or P["interval"], key="home_iv",
+                                    required=True, label_visibility="collapsed")
+    pf["ov"] = c2.pills("Overlays", CHART_OV, selection_mode="multi", default=pf["ov"], key="home_ov",
+                        label_visibility="collapsed")
+    pf["ind"] = c3.toggle("Indicators", value=pf["ind"], key="home_ind",
+                          help="Off: compact price + volume. On: confluence, RSI, MACD and ADX panes (taller chart)")
+    iv, ov, ca, note = pf["iv"] or P["interval"], list(pf["ov"] or []), a, None
+    if iv != P["interval"]:  # the sidebar interval reuses a['d']: no extra fetch
+        vix, _, fx = ss.get("vix", (None, None, None))
+        try:
+            with st.spinner(f"Loading {iv} candles…"):
+                a2 = analyze_fast(sel, dict(P, interval=iv, news=False, chain=False), vix, fx, now)
+        except Exception as e:
+            a2 = {"error": f"{type(e).__name__}: {e}"}
+        if "error" in a2:
+            note, iv = f"{iv} chart unavailable ({a2['error']}): showing {P['interval']}.", P["interval"]
+        else:
+            ca, note = a2, f"Signals use the sidebar interval ({P['interval']}); chart shows {iv}."
+    d = ca["d"]
+    st.html(ui_kit.ohlc_legend(sel, iv, ca["row"], spot, ca.get("src"), ca["has_vol"],
+                               d.Close.iloc[-2] if len(d) > 1 else None))
+    levels = _chart_levels(sel, a, r, spot, now) if "Levels" in ov else None
+    fig = make_chart(d, sel, a["spec"], ca["has_vol"], levels=levels, compact=not pf["ind"],
+                     overlays=[x for x in ov if x != "Levels"])
+    st.plotly_chart(fig, width="stretch", key="home_chart")
+    off = (fig.layout.meta or {}).get("off") if isinstance(fig.layout.meta, dict) else None
+    st.caption(" · ".join(x for x in (note, ("Off-chart: " + ", ".join(off)) if off else None,
+                                      "Levels: blue entry / trigger, red SL, green targets, white paper avg, dotted = OI "
+                                      "walls, max pain, expected range" if levels else None) if x))
+
+
+def _home_chain(sel, a, spot, q, now):
+    """Home 'Option chain' sub-tab: controls, summary chips, Calls | Strike | Puts table and a strike drill-down."""
+    chain = a.get("chain")
+    if not chain or not chain.get("quotes"):
+        st.info("No MCX option chain: connect Zerodha Kite (Upstox and NSE chains cover NSE/BSE only)."
+                if a["spec"]["kind"] == "commodity" else "No option chain for this symbol.")
+        return
+    spot = spot or chain.get("und") or a["ltp"]
+    # widget state is dropped on runs that skip these controls (no-chain symbol): keep the choices in a plain key
+    pf = st.session_state.setdefault("home_oc_pref", {"w": "±10", "view": "Calls & Puts", "greeks": False,
+                                                      "side": "CE", "k": {}})
+    c1, c2, c3 = st.columns([3, 3, 2], vertical_alignment="bottom")
+    pf["w"] = c1.segmented_control("Strikes", ["±5", "±10", "±15", "All"], default=pf["w"], key="home_oc_w")
+    pf["view"] = c2.segmented_control("View", ["Calls & Puts", "Calls", "Puts"], default=pf["view"], key="home_oc_view")
+    pf["greeks"] = greeks = c3.toggle("Greeks", value=pf["greeks"], key="home_oc_greeks",
+                                      help="Upstox: live Δ, θ/day and POP. Kite/NSE: model Δ (Black-Scholes from each "
+                                           "strike's IV)")
+    wk, view = pf["w"] or "±10", pf["view"] or "Calls & Puts"
+    w = {"±5": 5, "±10": 10, "±15": 15, "All": len(chain["quotes"])}[wk]
+    dte = E.option_dte(chain, P, now)
+    vq = q.get(upstox_feed.VIX_KEY) if q else None
+    vix = vq.get("last_price") if vq else (st.session_state.get("vix") or (None,))[0]
+    st.html(ui_kit.chain_chips(chain, spot, vix, dte, _home_oa(sel, a, spot, now)))
+    mdelta = None
+    if greeks:
+        T, rf = dte / 365, (0.0 if a["spec"]["kind"] == "commodity" else 0.065)
+        base = chain.get("atm_iv") or a.get("iv") or 0
+        mdelta = {(K, s): E.bs(spot, K, T, (x.get("iv") or 0) / 100 or base, s, rf)[1]
+                  for K, sides in chain["quotes"].items() for s, x in sides.items() if x and x.get("delta") is None}
+    st.html(ui_kit.option_chain_html(chain, spot, w, view, greeks, _oc_reads(chain, spot, w), mdelta))
+    st.caption(ui_kit.chain_caption(chain, len(ui_kit.chain_window(chain, spot, w)[0]))
+               + (" · model Δ = Black-Scholes from each strike's IV" if mdelta else ""))
+    ks = sorted(chain["quotes"])
+    atm = ui_kit.chain_window(chain, spot, 1)[1]
+    with st.expander("🔍 Strike drill-down: fair value, premium stop and targets", expanded=False):
+        d1, d2 = st.columns([3, 2], vertical_alignment="bottom")
+        k0 = next((k for k in (pf["k"].get(sel), atm) if k in ks), ks[0])  # last pick for this symbol, else ATM
+        K = pf["k"][sel] = d1.selectbox("Strike", ks, index=ks.index(k0), key=f"home_oc_k_{sel}",
+                                        format_func=lambda k: f"{k:g}")
+        pf["side"] = d2.segmented_control("Side", ["CE", "PE"], default=pf["side"], key="home_oc_side")
+        kind = pf["side"] or "CE"
+        try:
+            s = E.option_price_signal(a, kind, K, 0, False, 0, P, now)
+        except Exception as e:
+            st.caption(f"Drill-down unavailable: {type(e).__name__}: {e}")
+        else:
+            st.html(ui_kit.strike_drill(s, a["spec"]["name"]))
+            st.caption(f"Priced off the analysis LTP {a['ltp']:,.2f} with IV {a['iv'] * 100:.1f}% ({a['iv_src']}); "
+                       "live = chain mid/last. Display only: no order is placed.")
+
+
+def _sig(r):
+    """Watchlist signal text of a recommend() dict: '▲ CALL' / '▼ PUT' (+ ' ⏳' while waiting for its trigger) or '·'."""
+    if not r or r.get("mode") not in ("now", "trigger"):
+        return "·"
+    return ("▲ CALL" if r.get("kind") == "CE" else "▼ PUT") + ("" if r["mode"] == "now" else " ⏳")
+
+
+def _k(x):
+    x = ui_kit._num(x)
+    return "–" if x is None else f"{x:g}"
+
+
+def _home_toasts(recs, wl):
+    """Home toasts: the pending paper-exit result, alerts rows logged by runner.py / other sessions since
+    notif_last_id (rows this session already toasted are skipped), and watchlist flips into a live BUY CALL / PUT.
+    The first run only seeds notif_* and home_prev_sig. At most 3 alert and 3 signal toasts per run. A flip the paper
+    engine or intraday phone push already announced (ENTRY / BLOCKED / 'sig:' SIGNAL from run_scan or in the alert diff)
+    is not toasted twice."""
+    ss = st.session_state
+    if ss.get("pos_flash"):
+        st.toast(ss.pop("pos_flash"), icon="📤")
+    sig = {s: _sig(recs.get(s)) for s in wl if s in recs}
+    done = ss.pop("paper_syms", None) or set()
+    if "notif_seen_id" not in ss:
+        ss["notif_seen_id"] = ss["notif_last_id"] = paper.last_alert_id()
+        ss["home_prev_sig"] = sig
+        return
+    try:
+        new = paper.alerts_since(ss.get("notif_last_id", 0), limit=50)
+    except Exception:
+        new = []
+    own = ss.get("notif_own") or set()
+    for x in [x for x in new if x["key"] not in own][-3:]:
+        st.toast(str(x["text"] or "").split("\n")[0], icon=ALERT_ICON.get(x["kind"]))  # SIGNAL texts are multi-line
+    if new:
+        ss["notif_last_id"] = new[-1]["id"]
+    done |= {x["symbol"] for x in new if x["kind"] in ("ENTRY", "BLOCKED")
+             or str(x.get("key") or "").startswith("sig:")}  # intraday push_signals only, not BTST / 2-day SIGNALs
+    prev, n = ss.get("home_prev_sig") or {}, 0
+    for s, g in sig.items():
+        r = recs[s]
+        if g in ("▲ CALL", "▼ PUT") and prev.get(s, g) != g and s not in done and n < 3:
+            n += 1
+            prem = ui_kit._num(r.get("prem"))
+            st.toast(f"{s} {'BUY CALL' if r['kind'] == 'CE' else 'BUY PUT'} {_k(r.get('strike'))} {r['kind']}"
+                     + (f" @ {prem:.2f}" if prem is not None else ""), icon="📗" if r["kind"] == "CE" else "📕")
+    ss["home_prev_sig"] = sig
+
+
+def _home_bell(now):
+    """Header bell: unread alert count (ids above notif_seen_id) and the latest 8 alerts."""
+    seen = st.session_state.get("notif_seen_id", 0)
+    try:
+        n, al = len(paper.alerts_since(seen, limit=100)), paper.alerts_df(8)
+    except Exception:
+        n, al = 0, pd.DataFrame()
+    with st.popover(f"🔔 {n if n < 100 else '99+'}" if n else "🔔", key="home_bell", width="stretch",
+                    help="Paper engine alerts (shared journal)"):
+        st.html(ui_kit.notif_list(al.to_dict("records"), seen, now.date().isoformat()))
+        st.button("Mark all read", key="notif_read_pop", on_click=_notif_read, disabled=not n, width="stretch")
+    return n
+
+
+# Upstox NSE_INDEX sector indices: (tile label, instrument 'name' as in the NSE instruments file, checked Oct 2026)
+SECTORS = (("Bank", "Nifty Bank"), ("Pvt Bank", "Nifty Pvt Bank"), ("PSU Bank", "Nifty PSU Bank"),
+           ("Fin Service", "Nifty Fin Service"), ("IT", "Nifty IT"), ("Auto", "Nifty Auto"), ("Pharma", "Nifty Pharma"),
+           ("Healthcare", "NIFTY HEALTHCARE"), ("FMCG", "Nifty FMCG"), ("Metal", "Nifty Metal"), ("Realty", "Nifty Realty"),
+           ("Energy", "Nifty Energy"), ("Oil & Gas", "NIFTY OIL AND GAS"), ("Media", "Nifty Media"),
+           ("Cons. Durables", "NIFTY CONSR DURBL"), ("Infra", "Nifty Infra"), ("Commodities", "Nifty Commodities"),
+           ("Chemicals", "Nifty Chemicals"), ("CPSE", "Nifty CPSE"), ("Capital Mkt", "Nifty Capital Mkt"))
+WL_SORTS = ["Default", "A-Z", "% chg ↓", "% chg ↑", "LTP ↓", "Signal first"]
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _up_keys_c(day):
+    df = upstox_feed.instruments("NSE", day)  # cached 6h; raises (not cached) when the download fails
+    lst = pro.nifty50_constituents()
+    eq = df[df.segment == "NSE_EQ"].drop_duplicates("trading_symbol").set_index("trading_symbol").instrument_key
+    ix = df[df.segment == "NSE_INDEX"].drop_duplicates("name").set_index("name").instrument_key
+    return ({s: (eq[s], ind) for s, ind in zip(lst.Symbol, lst.Industry) if s in eq.index},
+            {lbl: ix[nm] for lbl, nm in SECTORS if nm in ix.index})
+
+
+def _up_keys(day):
+    """Upstox keys for Home's single batched quote: NIFTY 50 {symbol: (NSE_EQ key, industry)} and sector indices
+    {label: NSE_INDEX key}, from the instruments file. ({}, {}) when it is unreachable."""
+    try:
+        return _up_keys_c(day)
+    except Exception:
+        return {}, {}
+
+
+def _caret(v):
+    v = ui_kit._num(v)
+    return "–" if v is None else f"{'▲' if v >= 0 else '▼'} {abs(v):.2f}%"
+
+
+def _n50_live(q, keys, yahoo=True):
+    """NIFTY 50 movers frame: Symbol, Industry, last, chg (%), value (₹ cr), src (+ volume on Upstox). From the batched
+    Upstox quotes q when they hold the constituents, else (yahoo=True) pro.nifty50_moves (Yahoo daily, 120s cache).
+    None when neither works."""
+    rows = []
+    for s, (k, ind) in (keys or {}).items():
+        v = (q or {}).get(k) or {}
+        last, nc = ui_kit._num(v.get("last_price")), ui_kit._num(v.get("net_change"))
+        if last:
+            vol = ui_kit._num(v.get("volume")) or 0.0
+            rows.append(dict(Symbol=s, Industry=ind, last=last, chg=_pc(last, nc) if nc is not None else None,
+                             value=vol * (ui_kit._num(v.get("average_price")) or last) / 1e7, volume=vol, src="Upstox live"))
+    if rows:
+        return pd.DataFrame(rows)
+    if not yahoo:
+        return None
+    try:
+        df = pro.nifty50_moves()
+    except Exception:
+        df = None
+    if df is None or df.empty or not {"Symbol", "last", "chg"} <= set(df.columns):
+        return None
+    df = df.reindex(columns=["Symbol", "Industry", "last", "chg", "value"])
+    return df.assign(src="Yahoo daily close")
+
+
+def _nse_indices(now):
+    """pro.nse_indices() (120s cache), skipped for 10 minutes after a failure (NSE blocks cloud IPs: 2 × 8s timeouts)."""
+    ss = st.session_state
+    if ss.get("nse_down_until", 0) > now.timestamp():
+        return None, None
+    try:
+        df, br = pro.nse_indices()
+    except Exception:
+        df, br = None, None
+    if df is None:
+        ss["nse_down_until"] = now.timestamp() + 600
+    return df, br
+
+
+def _breadth(n50, live, now):
+    """Advance / decline / unchanged -> dict(adv, dec, unch, src) or None: NIFTY 50 frame (Upstox live, or Yahoo daily
+    when Movers fetched it this run), else the watchlist's change sign, else NSE allIndices (nse_down guard), else the
+    Yahoo NIFTY 50 frame."""
+    def count(ch, src):
+        ch = [c for c in (ui_kit._num(x) for x in ch) if c is not None]
+        return dict(adv=sum(c > 0 for c in ch), dec=sum(c < 0 for c in ch), unch=sum(c == 0 for c in ch), src=src) \
+            if ch else None
+    if n50 is not None and len(n50):
+        b = count(n50.chg, "NIFTY 50 live" if n50.src.iloc[0] == "Upstox live" else "NIFTY 50, daily")
+        if b:
+            return b
+    b = count([c for _, c in live.values()], "Watchlist")
+    if b:
+        return b
+    _, br = _nse_indices(now)
+    if br and (br.get("adv") or br.get("dec")):
+        return dict(br, src="NSE all")
+    y = _n50_live({}, {}, yahoo=True)
+    return count(y.chg, "NIFTY 50, daily") if y is not None else None
+
+
+def _sector_rows(q, sec, n50, keys, now):
+    """Sector tiles -> (rows, title): Upstox sector indices from the batched quote, else NSE allIndices SECTORAL
+    INDICES (nse_down guard), else NIFTY 50 industry averages of the movers frame; ([], None) when none work."""
+    rows = []
+    for lbl, k in (sec or {}).items():
+        v = (q or {}).get(k) or {}
+        last, nc = ui_kit._num(v.get("last_price")), ui_kit._num(v.get("net_change"))
+        if last:
+            rows.append(dict(name=lbl, chg=_pc(last, nc) if nc is not None else None))
+    title = "NSE sector indices · Upstox live"
+    if not rows:
+        df, _ = _nse_indices(now)
+        if df is not None and {"key", "index", "percentChange"} <= set(df.columns):
+            s = df[df.key == "SECTORAL INDICES"]
+            rows = [dict(name=str(n).replace("NIFTY ", ""), chg=c, adv=a, dec=d) for n, c, a, d in
+                    zip(s["index"], s.percentChange, s.get("advances", [None] * len(s)), s.get("declines", [None] * len(s)))]
+            title = "NSE sectoral indices · NSE"
+    if not rows:
+        m = n50 if n50 is not None else _n50_live(q, keys, yahoo=True)
+        if m is not None and len(m) and "Industry" in m:
+            g = m.dropna(subset=["chg"]).groupby("Industry").chg
+            rows = [dict(name=i, chg=c, adv=a, dec=d) for i, c, a, d in
+                    zip(g.mean().index, g.mean(), g.apply(lambda x: (x > 0).sum()), g.apply(lambda x: (x < 0).sum()))]
+            title = f"NIFTY 50 industries (average) · {m.src.iloc[0]}"
+    rows.sort(key=lambda r: -(ui_kit._num(r["chg"]) if ui_kit._num(r["chg"]) is not None else -1e9))
+    return rows, (title if rows else None)
+
+
+def _overview(now, tr, recs, wl):
+    """Overview card inputs: paper funds (capital + realised today - premium in open trades), paper positions (same
+    figures as the Positions strip) and the watchlist Signal-column counts."""
+    opn = tr[tr.status == "OPEN"]
+    cls = tr[(tr.status == "CLOSED") & tr.exit_at.fillna("").str.startswith(now.date().isoformat())]
+    realised, un = float(cls.pnl.sum()), paper.unrealized(opn)
+    used = float((opn.entry_p * opn.qty / np.where(opn.half == 1, 2, 1)).sum()) if len(opn) else 0.0
+    try:
+        rs = paper.risk_status(P, now)
+    except Exception:
+        rs = {}
+    funds = dict(avail=P["capital"] + realised - used, used=used, capital=P["capital"], realised=realised,
+                 risk_ok=rs.get("ok", True), reasons=rs.get("reasons"))
+    pos = dict(n=len(opn), pnl=realised + float(un.sum()), items=list(zip(_instr(opn), un.tolist())))
+    g = [_sig(recs.get(s)) for s in wl]
+    return funds, pos, dict(call=sum("▲" in x for x in g), put=sum("▼" in x for x in g), wait=sum("⏳" in x for x in g),
+                            none=sum(x == "·" for x in g))
+
+
+def _flash(prev, syms):
+    """Tick flash for Styler.apply on LTP: green / red background where LTP rose / fell since the last Home run."""
+    def f(col):
+        out = []
+        for s, x in zip(syms, col):
+            x, p = ui_kit._num(x), ui_kit._num(prev.get(s))
+            out.append("" if x is None or p is None or x == p else
+                       f"background-color:{'rgba(76,175,80,.28)' if x > p else 'rgba(239,83,80,.28)'}")
+        return out
+    return f
+
+
+def movers_block(n50, now):
+    """Home left 'Movers': NIFTY 50 top 10 gainers / losers / most active (₹ value); a click opens it on the right."""
+    ss = st.session_state
+    kind = st.segmented_control("Movers", ["Gainers", "Losers", "Most active"], key="home_mv_kind", required=True,
+                                default=ss.get("home_mv_pref", "Gainers"), label_visibility="collapsed") or "Gainers"
+    ss["home_mv_pref"] = kind
+    if n50 is None or n50.empty:
+        st.info("Market movers unavailable (NSE list and Upstox both unreachable).")
+        return
+    act = kind == "Most active"
+    d = n50.dropna(subset=["value" if act else "chg"])
+    d = d.sort_values("value" if act else "chg", ascending=kind == "Losers", kind="stable").head(10).reset_index(drop=True)
+    t = pd.DataFrame({"Symbol": d.Symbol, "LTP": d["last"], "Chg %": d.chg} | ({"Value (₹ cr)": d.value} if act else {}))
+    if ss.get("home_mv_order") != list(t.Symbol):  # rows moved: new key drops a stale positional highlight
+        ss["home_mv_v"] = ss.get("home_mv_v", 0) + 1
+    ss["home_mv_order"] = list(t.Symbol)
+    ss["home_mv_key"] = mkey = f"home_mv_{ss.get('home_mv_v', 0)}"
+    tint = lambda v: ("" if ui_kit._num(v) is None else "color:#4caf50" if v > 0 else "color:#ef5350" if v < 0 else "")
+    sty = t.style.map(tint, subset=["Chg %"]).format(_caret, subset=["Chg %"]).apply(
+        lambda c: [tint(x) for x in t["Chg %"]], subset=["Symbol"])
+    st.dataframe(sty, hide_index=True, width="stretch", on_select=_mv_pick, selection_mode="single-row", key=mkey,
+                 height=40 + 35 * len(t), column_config={"LTP": st.column_config.NumberColumn(format="%.2f"),
+                                                         "Value (₹ cr)": st.column_config.NumberColumn(format="%.1f")})
+    src = str(d.src.iloc[0]) if len(d) else ""
+    st.caption(f"{src} · {now.strftime('%H:%M')}" + (" · as of last trade" if src == "Upstox live" and
+                                                       not _mkt_open("nse", now) else "")
+               + " · tap a row to open it; '+ Add' puts it in your list")
+
+
 def home_tab():
+    if st.session_state.pop("home_full_rerun", False):
+        st.rerun(scope="app")  # after ✕ Remove / + Add / a list 1-5 switch: refresh the sidebar list and the scan
     now = pd.Timestamp.now(tz=IST)
     res = st.session_state.get("last_results")
     if not res:
         res, _, _ = run_scan(now)
-    wl = wl_list()
+    wl, ss = wl_list(), st.session_state
+    sel = ss.get("home_sel")
+    peek = bool(ss.get("home_peek")) and bool(sel) and sel not in wl  # opened from Movers, not in the list
+    if sel not in wl and not peek:
+        sel = wl[0] if wl else None
+    view = ss.get("home_left_view") or "Watchlist"  # read before the control renders: Yahoo movers fetch only when open
     tok = E.UPSTOX
-    qkeys = {s: _quote_key(s) for s in wl} if tok else {}
+    qkeys = {s: _quote_key(s) for s in wl + ([sel] if peek else [])} if tok else {}
+    n50k, seck = _up_keys(kite_day()) if tok else ({}, {})
     ikeys = {n: (upstox_feed.INDEX_KEYS[k] if k else upstox_feed.VIX_KEY) for n, k, _ in INDEX_STRIP}
-    q = upstox_feed.quotes(tok, tuple(dict.fromkeys(list(ikeys.values()) + [k for k in qkeys.values() if k]))) if tok else {}
+    q = upstox_feed.quotes(tok, tuple(dict.fromkeys(  # one batched call: indices, list (+ peek), NIFTY 50, sectors
+        list(ikeys.values()) + [k for k in qkeys.values() if k] + [k for k, _ in n50k.values()]
+        + list(seck.values())))) if tok else {}
     items = []
     for name, _, yt in INDEX_STRIP:
         v = q.get(ikeys[name])
@@ -1352,60 +2238,131 @@ def home_tab():
             lc, chg = last_close(yt)
             items.append((name, f"{lc:,.2f}" if lc else "n/a", (lc * chg / (1 + chg)) if lc and chg is not None else None,
                           chg * 100 if chg is not None else None))
-    st.html(ui_kit.kite_strip(items))
+    recs = {s: recommend(a, P) for s, a in res.items() if a and "error" not in a}  # once per run, reused below
+    _home_toasts(recs, wl)
+    hs, hb = st.columns([14, 2], vertical_alignment="center")
+    with hs:
+        st.html(ui_kit.kite_strip(items, _mkt_status(now)))
+    with hb:
+        unread = _home_bell(now)
 
-    left, right = st.columns([4, 8], gap="medium")
-    with left:
-        st.markdown(f"**Watchlist** <small style='color:#8ea0bf'>({len(wl)})</small>", unsafe_allow_html=True)
-        st.selectbox("Search & add", [x for x in symbols.labels() if symbols.to_symbol(x) not in wl], index=None,
-                     key="home_search", on_change=wl_add_from, args=("home_search",), accept_new_options=True,
-                     placeholder="🔍 Search eg: infy, nifty, tata…", label_visibility="collapsed")
+    def lc(s):
+        """(LTP, abs change) for a watchlist symbol: batched Upstox quote, else the scan's analysis."""
+        a, v = res.get(s), (q.get(qkeys.get(s)) if tok else None)
+        if v:
+            return v["last_price"], v.get("net_change")
+        if a and "error" not in a:
+            return a["ltp"], (a["ltp"] - a["row"].PDC) if pd.notna(a["row"].PDC) else None
+        return None, None
+    live = {s: lc(s) for s in wl}
+    n50 = _n50_live(q, n50k, yahoo=view == "Movers")
+    tr = paper.trades_df()
+    st.html(ui_kit.overview_cards(user.get("name") or user.get("username"), *_overview(now, tr, recs, wl),
+                                  _breadth(n50, live, now)))
+    credible_panel(res, "home", recs)
+
+    def watchlist_block():
+        """Left 'Watchlist': numbered lists 1-5, search + sort, the table (carets, tick flash; click a row to open it)."""
+        sets = auth.get_watchlist_sets(user["username"])
+        slot = ss.get("wl_slot", 1)
+        nm = (sets.get(slot) or {}).get("name") or f"Watchlist {slot}"
+        st.markdown(f"**{ui_kit.escape(nm)}** <small style='color:#8ea0bf'>({len(wl)})</small>", unsafe_allow_html=True)
+        c_s, c_o = st.columns([3, 2], vertical_alignment="center")
+        c_s.selectbox("Search & add", [x for x in symbols.labels() if symbols.to_symbol(x) not in wl], index=None,
+                      key="home_search", on_change=wl_add_from, args=("home_search",), accept_new_options=True,
+                      placeholder="🔍 Search eg: infy, nifty, tata…", label_visibility="collapsed")
+        srt = c_o.selectbox("Sort", WL_SORTS, key="home_wl_sort", label_visibility="collapsed",  # state dropped while
+                            index=WL_SORTS.index(ss.get("home_wl_sort_pref", "Default")))   # another view is open
+        ss["home_wl_sort_pref"] = srt = srt or "Default"
         rows = []
         for s in wl:
-            a = res.get(s)
-            v = q.get(qkeys.get(s)) if tok else None
-            if v:
-                ltp, ch = v["last_price"], v.get("net_change")
-            elif a and "error" not in a:
-                ltp, ch = a["ltp"], (a["ltp"] - a["row"].PDC) if pd.notna(a["row"].PDC) else None
-            else:
-                ltp, ch = None, None
-            sig = "·"
-            if a and "error" not in a:
-                r = recommend(a, P)
-                sig = ("▲ CALL" if r["kind"] == "CE" else "▼ PUT") + ("" if r["mode"] == "now" else " ⏳") if r["mode"] != "none" else "·"
+            r = recs.get(s)
+            ltp, ch = live[s]
             rows.append({"Instrument": s, "LTP": ltp, "Chg": ch, "Chg %": _pc(ltp, ch) if ltp and ch is not None else None,
-                         "Signal": sig})
+                         "Signal": _sig(r), "Cred.": ((r or {}).get("cred") or {}).get("grade") or "–",
+                         "Event": _ev_cell((res.get(s) or {}).get("events"))})
         if not rows:
             st.info("Search above to add stocks.")
-            return
-        wdf = pd.DataFrame(rows)
+        else:
+            wdf = pd.DataFrame(rows)
+            if not wdf.Event.astype(bool).any():
+                wdf = wdf.drop(columns="Event")
+            if srt == "A-Z":  # display order only: the saved list order is untouched
+                wdf = wdf.sort_values("Instrument", kind="stable")
+            elif srt.startswith("% chg"):
+                wdf = wdf.sort_values("Chg %", ascending=srt.endswith("↑"), na_position="last", kind="stable")
+            elif srt == "LTP ↓":
+                wdf = wdf.sort_values("LTP", ascending=False, na_position="last", kind="stable")
+            elif srt == "Signal first":
+                wdf = wdf.iloc[np.argsort([2 if g == "·" else 1 if "⏳" in g else 0 for g in wdf.Signal], kind="stable")]
+            wdf = wdf.reset_index(drop=True)
+            if ss.get("home_wl_order") != list(wdf.Instrument):  # rows moved: new key resets a stale highlight
+                ss["home_wl_v"] = ss.get("home_wl_v", 0) + 1
+            ss["home_wl_order"] = list(wdf.Instrument)  # _wl_pick maps the clicked row through this
+            ss["home_wl_key"] = wkey = f"home_wl_{ss.get('home_wl_v', 0)}"
 
-        def col(v):
+            def col(v):
+                try:
+                    return "color:#4caf50" if float(v) > 0 else "color:#ef5350" if float(v) < 0 else ""
+                except (TypeError, ValueError):
+                    s = str(v)
+                    return ("color:#4caf50;font-weight:700" if "CALL" in s else "color:#ef5350;font-weight:700" if "PUT" in s
+                            else "color:#64748b")
+            grade = {"A": "color:#4caf50;font-weight:700", "B": "color:#38bdf8;font-weight:700", "C": "color:#f59e0b",
+                     "D": "color:#ef5350"}
+            prev = ss.get("home_prev_ltp") or {}
+            sty = (wdf.style.map(col, subset=["Chg", "Chg %", "Signal"])
+                   .map(lambda g: grade.get(g, "color:#64748b"), subset=["Cred."])
+                   .apply(lambda c: [col(x) if ui_kit._num(x) is not None else "" for x in wdf.Chg], subset=["Instrument"])
+                   .apply(_flash(prev, list(wdf.Instrument)), subset=["LTP"])
+                   .format(_caret, subset=["Chg %"]))  # ▲/▼ carets: Styler text, so no NumberColumn format on Chg %
+            if "Event" in wdf:
+                sty = sty.map(lambda e: "color:#fbbf24;font-weight:700" if str(e).startswith("⚠") else "color:#8ea0bf",
+                              subset=["Event"])
+            st.dataframe(sty, hide_index=True, width="stretch", on_select=_wl_pick, selection_mode="single-row", key=wkey,
+                         height=min(40 + 35 * len(wdf), 760),
+                         column_config={"LTP": st.column_config.NumberColumn(format="%.2f"),
+                                        "Chg": st.column_config.NumberColumn(format="%+.2f"),
+                                        "Cred.": st.column_config.TextColumn(
+                                            "Cred.", width="small", help="Credibility grade A-D of the signal "
+                                                                         "(back-test edge, live record, liquidity, data)"),
+                                        "Event": st.column_config.TextColumn(
+                                            "Event", width="small", help="Corporate event or expiry within 5 days. "
+                                                                         "⚠ amber = results today/tomorrow or expiry day "
+                                                                         "(IV crush / extreme theta). Details in the quote "
+                                                                         "header badge.")})
+            ss["home_prev_ltp"] = {s: x for s, x in zip(wdf.Instrument, wdf.LTP) if ui_kit._num(x) is not None}
+            st.caption("Tap a row to open it · ▲ CALL / ▼ PUT = signal, ⏳ = waiting for trigger · Cred. = credibility A-D"
+                       + (" · ⚠ Event = results / expiry risk" if "Event" in wdf else "")
+                       + " · LTP flashes green / red when it moved since the last refresh")
+        c_l, c_n, c_e = st.columns([6, 2, 1], vertical_alignment="center")
+        c_l.segmented_control("List", [1, 2, 3, 4, 5], key="home_wl_slot", default=slot, required=True,
+                              on_change=wl_switch_slot, label_visibility="collapsed",
+                              format_func=lambda k: str(k), help="Watchlists 1-5: " + " · ".join(
+                                  f"{k}: {(sets.get(k) or {}).get('name') or f'Watchlist {k}'} "
+                                  f"({len((sets.get(k) or {}).get('symbols') or [])})" for k in range(1, 6)))
+        c_n.caption(f"{len(wl)} / 40")
+        with c_e.popover("✎", help="Rename this list"):
+            st.text_input("Name", key="wl_slot_name", max_chars=24, placeholder=f"Watchlist {slot}")
+            st.button("Save", key="wl_slot_save", on_click=_wl_rename, type="primary", width="stretch")
+        if ss.get("wl_slot_note") and paper.SETTINGS.exists():
             try:
-                return "color:#4caf50" if float(v) > 0 else "color:#ef5350" if float(v) < 0 else ""
-            except (TypeError, ValueError):
-                s = str(v)
-                return ("color:#4caf50;font-weight:700" if "CALL" in s else "color:#ef5350;font-weight:700" if "PUT" in s
-                        else "color:#64748b")
-        ev = st.dataframe(wdf.style.map(col, subset=["Chg", "Chg %", "Signal"]), hide_index=True, width="stretch",
-                          on_select="rerun", selection_mode="single-row", key="home_wl",
-                          height=min(40 + 35 * len(wdf), 760),
-                          column_config={"LTP": st.column_config.NumberColumn(format="%.2f"),
-                                         "Chg": st.column_config.NumberColumn(format="%+.2f"),
-                                         "Chg %": st.column_config.NumberColumn(format="%+.2f%%")})
-        picked = ev.selection.rows if ev and ev.selection else []
-        if picked:
-            st.session_state["home_sel"] = wdf.Instrument.iloc[picked[0]]
-        sel = st.session_state.get("home_sel")
-        if sel not in wl:
-            sel = wl[0]
-        st.caption("Tap a row to open it · ▲ CALL / ▼ PUT = signal, ⏳ = waiting for trigger")
-        if st.button(f"✕ Remove {sel}", key="home_del", use_container_width=True):
-            wl_delete(sel)
-            st.rerun()
+                same = set(paper.load_settings().get("symbols") or []) == set(wl)
+            except Exception:
+                same = False
+            if not same:
+                st.caption("Background engine still uses the symbols saved in Paper trading; re-save to update")
 
-    with right:
+    def sectors_block():
+        """Left 'Sectors': heat tiles (Upstox sector indices, else NSE allIndices, else NIFTY 50 industry averages)."""
+        rows, title = _sector_rows(q, seck, n50, n50k, now)
+        if rows:
+            st.html(ui_kit.sector_tiles(rows, title))
+        else:
+            st.caption("Sector data unavailable")
+
+    def quote_block(sel):
+        """Right column: quote header, action buttons and the Chart / depth / chain / recommendation sub-tabs."""
         a = res.get(sel)
         if a is None or "error" in a:
             with st.spinner(f"Loading {sel}…"):
@@ -1413,7 +2370,7 @@ def home_tab():
         if "error" in a:
             st.error(f"{sel}: {a['error']}")
             return
-        r = recommend(a, P)
+        r = recs.get(sel) or recommend(a, P)
         v = q.get(qkeys.get(sel)) if tok else None
         ltp, ch = (v["last_price"], v.get("net_change")) if v else (a["ltp"], (a["ltp"] - a["row"].PDC)
                                                                       if pd.notna(a["row"].PDC) else None)
@@ -1433,7 +2390,13 @@ def home_tab():
         else:
             buy = side(r, "CE", r["mode"] == "trigger") if r["kind"] == "CE" else None
             sell = side(r, "PE", r["mode"] == "trigger") if r["kind"] == "PE" else None
-        st.html(ui_kit.quote_header(sel, exch, ltp, ch, _pc(ltp, ch) if ch is not None else None, buy, sell))
+        st.html(ui_kit.quote_header(sel, exch, ltp, ch, _pc(ltp, ch) if ch is not None else None, buy, sell,
+                                    a.get("events"), _fresh(a, v, now)))
+        try:
+            lo_, hi_, dt_, wlo, whi, qs_ = _ranges(a, v, ltp, exch)
+            st.html(ui_kit.range_bars(lo_, hi_, ltp, wlo, whi, qs_, dt_))
+        except Exception as e:  # ranges are cosmetic: never break the quote panel
+            st.caption(f"Ranges unavailable: {type(e).__name__}")
         status = (f"**{r['action']}** · confidence {r['conf']}" if r["mode"] != "none" else
                   f"**No trade** · score {r['score']:+.1f}: conditional plans shown on the buttons")
         st.caption(status + " · display only: place orders in your broker app")
@@ -1441,83 +2404,267 @@ def home_tab():
             st.caption("⚠ " + n)
         t_chart, t_depth, t_chain, t_reco = st.tabs(["Chart", "Market depth", "Option chain", "Recommendation"])
         with t_chart:
-            st.plotly_chart(make_chart(a["d"], sel, a["spec"], a["has_vol"]), width="stretch", key="home_chart")
+            _home_chart(sel, a, r, ltp, now)
         with t_depth:
             if v:
-                st.html(ui_kit.depth_html(v))
+                st.html(ui_kit.depth_html(v, exch))
                 if not (v.get("depth") or {}).get("buy") or not any(x.get("price") for x in v["depth"]["buy"]):
                     st.caption("Depth is empty outside market hours or for indices.")
             else:
                 st.info("Market depth needs the Upstox data source (sidebar).")
         with t_chain:
-            if a.get("chain"):
-                st.dataframe(oi_table(a["chain"], ltp), hide_index=True, width="stretch")
-                st.caption(f"{a['chain']['source']} · expiry {a['chain']['expiry']} · PCR {a['chain']['pcr'] or 0:.2f} · "
-                           f"max pain {a['chain']['max_pain']:g}")
-            else:
-                st.info("No option chain for this symbol.")
+            _home_chain(sel, a, ltp, q, now)
         with t_reco:
             st.html(ui_kit.reco_card(r, _chg(a), ui_kit.sparkline(_spark(a))))
 
-    st.markdown("#### Positions")
-    tr = paper.trades_df()
-    opn = tr[tr.status == "OPEN"]
-    if opn.empty:
-        st.caption("No open paper positions. Paper trades open automatically when a BUY CALL / BUY PUT signal fires.")
+    left, right = st.columns([4, 8], gap="medium")
+    with left:
+        lv = st.segmented_control("Left view", ["Watchlist", "Movers", "Sectors"], default="Watchlist", required=True,
+                                  key="home_left_view", label_visibility="collapsed") or "Watchlist"
+        if lv == "Movers":  # only the open view's body runs (no NSE / Yahoo calls for hidden views)
+            movers_block(n50, now)
+        elif lv == "Sectors":
+            sectors_block()
+        else:
+            watchlist_block()
+        if peek:
+            st.button(f"+ Add {sel} to watchlist", key="home_add", type="primary", width="stretch", on_click=wl_add_sym,
+                      args=(sel,))
+        elif sel and lv == "Watchlist":
+            st.button(f"✕ Remove {sel}", key="home_del", use_container_width=True, on_click=_home_remove, args=(sel,))
+    with right:
+        if sel:
+            if peek:
+                st.caption(f"{sel} is not in your watchlist (opened from Movers).")
+            quote_block(sel)
+    home_bottom(now, res, recs, {s: x[0] for s, x in live.items()}, wl, unread, tr)  # always (empty list / failed symbol)
+
+
+def home_bottom(now, res, recs, ltps, wl, unread=0, tr=None):
+    """Home bottom section: Positions / Triggers (GTT view) / Notifications. A segmented control rather than st.tabs,
+    so only the open view's body runs on each fragment run."""
+    st.divider()
+    tr = paper.trades_df() if tr is None else tr
+    n_open = int((tr.status == "OPEN").sum())
+    lbl = {"Positions": f"Positions ({n_open})", "Notifications": f"Notifications ({unread})" if unread else "Notifications"}
+    b1, b2 = st.columns([5, 3], vertical_alignment="bottom")
+    view = b1.segmented_control("Section", ["Positions", "Triggers (GTT view)", "Notifications"], default="Positions",
+                                required=True, format_func=lambda x: lbl.get(x, x), key="home_bottom",
+                                label_visibility="collapsed") or "Positions"
+    if view == "Positions":
+        positions_panel(now, res, b2, tr)
+    elif view == "Notifications":
+        notifications_panel(now, unread)
     else:
-        pnl = np.where(opn.half == 1, (opn.half_p - opn.entry_p) * opn.qty / 2 + (opn.last_p - opn.entry_p) * opn.qty / 2,
-                       (opn.last_p - opn.entry_p) * opn.qty)
-        pos = pd.DataFrame({"Instrument": opn.symbol + " " + opn.strike.map(lambda x: f"{x:g}") + " " + opn.kind,
-                            "Qty.": opn.qty.where(opn.half == 0, opn.qty / 2).astype(int), "Avg.": opn.entry_p,
-                            "LTP": opn.last_p, "P&L": pnl, "Chg %": (opn.last_p / opn.entry_p - 1) * 100,
-                            "SL": opn.sl_p, "T1": opn.t1_p, "T2": opn.t2_p})
-        tot = float(pnl.sum())
-        st.dataframe(pos.style.map(lambda x: "color:#4caf50" if x > 0 else "color:#ef5350" if x < 0 else "",
-                                   subset=["P&L", "Chg %"]), hide_index=True, width="stretch",
-                     column_config={c: st.column_config.NumberColumn(format="%.2f") for c in
-                                    ("Avg.", "LTP", "P&L", "SL", "T1", "T2")} | {
-                         "Chg %": st.column_config.NumberColumn(format="%+.2f%%")})
-        st.markdown(f"Total P&L <span style='color:{'#4caf50' if tot >= 0 else '#ef5350'};font-weight:700'>"
-                    f"₹{tot:,.0f}</span> <small style='color:#8ea0bf'>(paper)</small>", unsafe_allow_html=True)
+        df = triggers_table(recs, ltps, tr[tr.status == "OPEN"], wl, res)
+        if df.empty:
+            st.caption("Nothing pending: no watchlist symbol has a BUY CALL / BUY PUT plan and no paper trade is open.")
+        else:
+            pc = ["Trig. % away", "SL % away", "Tgt % away"]
+            amber = lambda x: ("background-color:rgba(245,158,11,.22);color:#fbbf24;font-weight:700"
+                               if pd.notna(x) and abs(x) <= 0.25 else "")
+            st.dataframe(df.style.map(amber, subset=pc), hide_index=True, width="stretch",
+                         column_config={c: st.column_config.NumberColumn(format="%.2f") for c in
+                                        ("Trigger", "SL", "Target", "LTP")} |
+                                       {c: st.column_config.NumberColumn(format="%+.2f%%") for c in pc})
+        st.caption("Display only: no GTT or order is placed. Levels are on the underlying; premiums are in the "
+                   "Recommendation tab. Amber = a pending level within 0.25% of LTP (SL / target % away start once a "
+                   "Waiting trigger fills). Symbols with an open paper trade show only the "
+                   "paper OCO row. Updates (and toasts) while Home runs: turn Auto on.")
 
 
-TABS = ["🏠 Home", "📊 Signals board", "⭐ Watchlist", "📈 NIFTY 50", "✅ Track record", "⚡ Stock → CALL/PUT", "🔎 Analysis", "🧠 Options analytics", "🌐 Market intel",
+def _instr(df):
+    return [f"{s} {_k(k)} {t}" + (f" · {e}" if isinstance(e, str) and e else "")
+            for s, k, t, e in zip(df.symbol, df.strike, df.kind, df.expiry)]
+
+
+def _pos_frame(opn, cls):
+    """Kite-style positions rows: open (remaining qty, MTM) then closed today (qty 0, exit premium, realised)."""
+    o = pd.DataFrame({"id": opn.id, "Product": "MIS", "Instrument": _instr(opn),
+                      "Qty.": opn.qty / np.where(opn.half == 1, 2, 1), "Avg.": opn.entry_p, "LTP": opn.last_p,
+                      "P&L": paper.unrealized(opn), "Chg %": (opn.last_p / opn.entry_p - 1) * 100, "SL": opn.sl_p,
+                      "T1": opn.t1_p, "T2": opn.t2_p, "Status": np.where(opn.half == 1, "T1 booked", "Open"),
+                      "Time": opn.opened_at.fillna("").str[11:16], "_k": "o"})
+    c = pd.DataFrame({"id": cls.id, "Product": "MIS", "Instrument": _instr(cls), "Qty.": 0.0, "Avg.": cls.entry_p,
+                      "LTP": cls.exit_p, "P&L": cls.pnl, "Chg %": (cls.exit_p / cls.entry_p - 1) * 100, "SL": cls.sl_p,
+                      "T1": cls.t1_p, "T2": cls.t2_p, "Status": cls.exit_reason.fillna("closed"),
+                      "Time": cls.exit_at.fillna("").str[11:16], "_k": "c",
+                      "Avg buy": cls.entry_p, "Avg sell": np.where(cls.half == 1, (cls.half_p + cls.exit_p) / 2, cls.exit_p),
+                      "Realised P&L": cls.pnl, "R": cls.r_mult})
+    return o, c
+
+
+def _with_total(df, col):
+    return pd.concat([df, pd.DataFrame([{"Instrument": "Total", col: float(df[col].sum()), "_k": "t"}])],
+                     ignore_index=True)
+
+
+def _pos_table(df, cols, money, **kw):
+    """Styled positions dataframe: closed rows greyed, Total row bold, P&L / Chg % green-red; id and _k hidden."""
+    def row(r):
+        return ["color:#64748b" if r["_k"] == "c" else "font-weight:700" if r["_k"] == "t" else ""] * len(r)
+    tint = lambda x: "color:#4caf50" if pd.notna(x) and x > 0 else "color:#ef5350" if pd.notna(x) and x < 0 else ""
+    fmt = {c: st.column_config.NumberColumn(format="%.2f") for c in ("Avg.", "LTP", "SL", "T1", "T2", "Avg buy", "Avg sell")}
+    fmt |= {c: st.column_config.NumberColumn(format="₹%.0f") for c in money}
+    fmt |= {"Chg %": st.column_config.NumberColumn(format="%+.2f%%"), "R": st.column_config.NumberColumn(format="%+.2f"),
+            "Qty.": st.column_config.NumberColumn(format="%g")}  # %g: half of an odd lot stays 37.5, not 37
+    return st.dataframe(df.style.apply(row, axis=1).map(tint, subset=[c for c in money + ["Chg %"] if c in df]),
+                        column_order=cols, hide_index=True, width="stretch", column_config=fmt, **kw)
+
+
+def positions_panel(now, res, slot=None, tr=None):
+    """Home Positions: paper P&L strip (shared journal), Open / Closed today / All today views with Kite day's history,
+    and a paper exit for admins. Display only: never a broker order."""
+    tr = paper.trades_df() if tr is None else tr
+    opn = tr[tr.status == "OPEN"]
+    cls = tr[(tr.status == "CLOSED") & tr.exit_at.fillna("").str.startswith(now.date().isoformat())]
+    realised, unreal = float(cls.pnl.sum()), float(paper.unrealized(opn).sum())
+    # the filter is not rendered while another bottom view is open (state dropped): keep the choice in a plain key
+    f = (slot or st).segmented_control("Show", ["Open", "Closed today", "All today"], required=True, key="home_pos_f",
+                                       default=st.session_state.get("home_pos_pref", "Open"),
+                                       label_visibility="collapsed") or "Open"
+    st.session_state["home_pos_pref"] = f
+    st.html(ui_kit.pnl_summary(realised + unreal, realised, unreal, len(opn), len(cls)))
+    o, c = _pos_frame(opn, cls)
+    base = ["Product", "Instrument", "Qty.", "Avg.", "LTP", "P&L", "Chg %", "SL", "T1", "T2", "Status", "Time"]
+    if f == "Closed today":
+        if c.empty:
+            st.caption("Nothing closed today.")
+        else:
+            _pos_table(_with_total(c, "Realised P&L"), ["Product", "Instrument", "Avg buy", "Avg sell", "Realised P&L",
+                                                        "R", "Chg %", "Status", "Time"], ["Realised P&L"])
+        return
+    if f == "All today":
+        if o.empty and c.empty:
+            st.caption("No paper trades today.")
+        else:
+            _pos_table(_with_total(pd.concat([o, c[o.columns]], ignore_index=True), "P&L"), base, ["P&L"])
+        return
+    if o.empty:
+        st.caption("No open paper positions. Paper trades open automatically when a BUY CALL / BUY PUT signal fires.")
+        return
+    ids = [int(x) for x in o.id]
+    if st.session_state.get("home_pos_ids") != ids:  # rows changed: new key drops a stale positional selection
+        st.session_state["home_pos_v"] = st.session_state.get("home_pos_v", 0) + 1
+    st.session_state["home_pos_ids"] = ids
+    o = o.reset_index(drop=True)  # only open rows are selectable; Total goes in its own non-selectable table below
+    ev = _pos_table(o, base, ["P&L"], on_select="rerun", selection_mode="single-row",
+                    key=f"home_pos_{st.session_state.get('home_pos_v', 0)}")
+    _pos_table(_with_total(o, "P&L").tail(1), base, ["P&L"], key="home_pos_total")
+    rows = list(((ev or {}).get("selection") or {}).get("rows") or [])
+    if user["role"] != "admin":
+        st.caption("Paper journal is shared; only admins can exit paper trades.")
+    elif rows and rows[0] < len(o):
+        t = o.iloc[rows[0]]
+        with st.popover(f"Exit (paper) {t.Instrument}", type="primary"):
+            st.caption("Closes this paper trade at the current premium. No broker order is placed.")
+            st.button("Exit (paper)", type="primary", key=f"pos_exit_{int(t.id)}", on_click=_paper_exit,
+                      args=(int(t.id),))
+    else:
+        st.caption("Select a row to exit it (paper). Paper journal is shared: an exit affects every user.")
+
+
+def triggers_table(recs, ltps, opn, wl, res=None):
+    """GTT-style view (display only): one row per watchlist BUY CALL / PUT plan ('Single' trigger while waiting, 'OCO'
+    SL/target once live) and one OCO row per open paper trade; a symbol with an open paper trade shows only that row.
+    % away = level / LTP - 1. Sorted by the nearest pending level (trigger while waiting, else SL / target)."""
+    def away(x, l):
+        x, l = ui_kit._num(x), ui_kit._num(l)
+        return (x / l - 1) * 100 if x is not None and l else None
+    held, rows = set(opn.symbol), []
+    for s in wl:
+        r = recs.get(s)
+        if not r or r.get("mode") not in ("now", "trigger") or s in held:
+            continue
+        w, l = r["mode"] == "trigger", ltps.get(s)
+        rows.append(dict(Instrument=f"{s} {_k(r.get('strike'))} {r.get('kind') or ''}", Type="Single" if w else "OCO",
+                         Trigger=r.get("u_entry") if w else None, SL=r.get("u_sl"), Target=r.get("u_t1"), LTP=l,
+                         Status="Waiting" if w else "Active"))
+    for t in opn.itertuples():
+        a = (res or {}).get(t.symbol) or {}
+        l = ltps.get(t.symbol) or (a.get("ltp") if "error" not in a else None) or ui_kit._num(t.last_u)
+        rows.append(dict(Instrument=f"{t.symbol} {_k(t.strike)} {t.kind} · paper", Type="OCO", Trigger=None,
+                         SL=t.stop_u, Target=t.t2_u if t.half == 1 else t.t1_u, LTP=l,
+                         Status="T1 booked" if t.half == 1 else "Active"))
+    cols = ["Instrument", "Type", "Trigger", "Trig. % away", "SL", "SL % away", "Target", "Tgt % away", "LTP", "Status"]
+    if not rows:
+        return pd.DataFrame(columns=cols)
+    df = pd.DataFrame(rows)
+    df["LTP"] = pd.to_numeric(df.LTP, errors="coerce")
+    for lv, pc in (("Trigger", "Trig. % away"), ("SL", "SL % away"), ("Target", "Tgt % away")):
+        df[lv] = pd.to_numeric(df[lv], errors="coerce")
+        df[pc] = pd.to_numeric(pd.Series([away(x, l) for x, l in zip(df[lv], df.LTP)], index=df.index), errors="coerce")
+    df.loc[df.Status == "Waiting", ["SL % away", "Tgt % away"]] = np.nan  # only the trigger is pending before a fill
+
+    def near(r):
+        v = [r["Trig. % away"]] if r.Status == "Waiting" else [r["SL % away"], r["Tgt % away"]]
+        v = [abs(x) for x in v if pd.notna(x)]
+        return min(v) if v else np.inf
+    return df.assign(_n=df.apply(near, axis=1)).sort_values("_n", kind="stable")[cols].reset_index(drop=True)
+
+
+def notifications_panel(now, unread=None):
+    """Home Notifications: the latest 30 paper-engine alerts (shared journal), unread since 'Mark all read'. unread is
+    the bell's count (all rows above notif_seen_id, capped at 100), so the label, bell and caption agree."""
+    try:
+        al = paper.alerts_df(30)
+    except Exception:
+        al = pd.DataFrame(columns=["id"])
+    seen = st.session_state.get("notif_seen_id", 0)
+    if unread is None:
+        try:
+            unread = len(paper.alerts_since(seen, limit=100))
+        except Exception:
+            unread = 0
+    n = int(unread)
+    c1, c2 = st.columns([5, 2], vertical_alignment="center")
+    c1.caption(f"{n if n < 100 else '99+'} unread · CALL/PUT phone alerts, paper entries, T1, exits and blocked signals (app or runner.py). The "
+               "journal is shared, so every user sees every event. Toasts show while Home runs (turn Auto on).")
+    c2.button("Mark all read", key="notif_read", on_click=_notif_read, disabled=not n, width="stretch")
+    st.html(ui_kit.notif_list(al.to_dict("records"), seen, now.date().isoformat()))
+
+
+TABS = ["🏠 Home", "📊 Signals board", "⭐ Watchlist", "📈 NIFTY 50", "✅ Track record", "⚡ Stock → CALL/PUT", "🌙 BTST & 2-day", "📅 Results", "🔎 Analysis", "🧠 Options analytics", "🌐 Market intel",
         "💰 CE/PE price check", "🧮 Spread builder", "📒 Paper trading & alerts", "🚀 Momentum scanner",
         "🎯 Position manager", "📖 Method"] + (["👥 Users"] if user["role"] == "admin" else [])
 tabs = st.tabs(TABS)
-with tabs[0]:
+with tabs[TABS.index("🏠 Home")]:
     st.fragment(home_tab, run_every=every if auto else None)()
-with tabs[1]:
+with tabs[TABS.index("📊 Signals board")]:
     st.fragment(dashboard, run_every=every if auto else None)()
-with tabs[2]:
+with tabs[TABS.index("⭐ Watchlist")]:
     watchlist_tab()
-with tabs[3]:
+with tabs[TABS.index("📈 NIFTY 50")]:
     nifty50_tab()
-with tabs[4]:
+with tabs[TABS.index("✅ Track record")]:
     track_tab()
-with tabs[5]:
+with tabs[TABS.index("⚡ Stock → CALL/PUT")]:
     quick_tab()
-with tabs[6]:
+with tabs[TABS.index("🌙 BTST & 2-day")]:
+    horizons_tab()
+with tabs[TABS.index("📅 Results")]:
+    results_tab()
+with tabs[TABS.index("🔎 Analysis")]:
     analysis_tab()
-with tabs[7]:
+with tabs[TABS.index("🧠 Options analytics")]:
     options_tab()
-with tabs[8]:
+with tabs[TABS.index("🌐 Market intel")]:
     market_tab()
-with tabs[9]:
+with tabs[TABS.index("💰 CE/PE price check")]:
     price_check()
-with tabs[10]:
+with tabs[TABS.index("🧮 Spread builder")]:
     spread_tab()
-with tabs[11]:
+with tabs[TABS.index("📒 Paper trading & alerts")]:
     paper_tab(SYMBOLS)
-with tabs[12]:
+with tabs[TABS.index("🚀 Momentum scanner")]:
     scanner()
-with tabs[13]:
+with tabs[TABS.index("🎯 Position manager")]:
     position_manager()
 if user["role"] == "admin":
-    with tabs[15]:
+    with tabs[TABS.index("👥 Users")]:
         users_tab()
 
-with tabs[14]:
+with tabs[TABS.index("📖 Method")]:
     st.markdown("""
 **Six parameter groups** feed the confluence score, each shown with its own sub-score:
 1. **Moving averages** (trend direction): EMA9/21/50, VWAP, Supertrend, ADX/DMI, 15- and 60-min trend
@@ -1528,7 +2675,9 @@ with tabs[14]:
 6. **Support/resistance & structure**: opening range, previous-day high/low, CPR, pivots, swing highs/lows, HH/HL, candle patterns, room to the next level
 
 **Pipeline.** A trade needs all of: (1) a named **setup** firing within the last *N* closed bars, (2) **confluence** votes agreeing with it
-(threshold +1 in a Mixed regime), (3) the **15-min trend** not against it, (4) the **entry window**, and (5) price not more than 2.5 ATR from EMA21.
+(threshold +1 in a Mixed regime), (3) the **15-min trend** not against it, (4) the **entry window**, (5) price not more than 2.5 ATR from EMA21,
+and (6) the **confirmation filters** (sidebar): NIFTY 50 trend not against the trade, the stock leading (CALL) or lagging (PUT) NIFTY today,
+and the daily close on the right side of its 20-day EMA. Each call shows its risk:reward and the level that invalidates it.
 Trend setups are disabled in a **Range** regime (ADX < 20 and Choppiness > 61.8); only VWAP-band reversion runs there.
 
 | Component | Rule | Reference |
@@ -1546,7 +2695,7 @@ Trend setups are disabled in a **Range** regime (ADX < 20 and Choppiness > 61.8)
 | Option pricing | Black-Scholes; Black-76 (r = 0) for MCX options on futures; calibrated to the live NSE quote | Black & Scholes (1973); Black (1976) |
 | Price targets | confluence of floor pivots R1–R3/S1–S3, Camarilla H3/H4/L3/L4, PDH/PDL, OR ± 1×range, swings, OI walls, IV-implied 1σ/2σ move | T. Person, *A Complete Guide to Technical Trading Tactics* (2004); N. Stott (Camarilla, 1989) |
 | Touch probability | reflection principle for a driftless random walk: P = 2·(1 − N(\\|ln(L/S)\\| / σ√t)) | J. C. Hull, *Options, Futures, and Other Derivatives* |
-| Risk & sizing | fixed-fractional risk in R multiples, 50% at 1R + breakeven, trail | V. K. Tharp, *Trade Your Way to Financial Freedom* (1998) |
+| Risk & sizing | fixed-fractional risk in R multiples, 50% at T1 (0.5R default) + breakeven, trail to 2R | V. K. Tharp, *Trade Your Way to Financial Freedom* (1998) |
 
 **Known limits.** Yahoo intraday data can be delayed and NSE indices carry no volume. The NSE option-chain API is unofficial. MCX prices are
 NYMEX × USDINR proxies, not MCX quotes. The backtest measures the underlying in R, not option P&L.

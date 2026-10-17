@@ -35,13 +35,17 @@ def one_pass(cfg):
     E.KITE = None if E.UPSTOX else kf.headless()
     vix, _ = E.last_close("^INDIAVIX")
     fx, _ = E.last_close("USDINR=X")
-    results = {}
-    for s in symbols:
-        try:
-            results[s] = E.analyze(s, dict(P, news=False), vix, fx, now)
-        except Exception as e:
-            results[s] = dict(error=str(e))
-    new = paper.notify(paper.paper_step(results, P, now), send=cfg.get("telegram", True))
+    results = E.analyze_many(symbols, dict(P, news=False), vix, fx, now, fn=E.analyze)
+    try:
+        paper.save_chain_snaps(results, now)  # option-chain history for IV rank / OI build-up research
+    except Exception:
+        traceback.print_exc()
+    send = cfg.get("telegram", True)
+    recs = [(s, E.recommend(a, P)) for s, a in results.items() if "error" not in a]
+    new = paper.push_signals(recs, now, P.get("alert_grade", "C"), send=send)  # CALL/PUT alerts to the phone
+    new += paper.push_horizons(symbols, now, P.get("alert_grade", "C"), fx, send=send)  # BTST / 2-day before close
+    new += paper.push_news(symbols, now, send=send)  # NSE corporate filings on watched symbols (context)
+    new += paper.notify(paper.paper_step(results, P, now), send=send)
     src = "Upstox" if E.UPSTOX else "Kite" if E.KITE is not None else "Yahoo/NSE"
     board = "  ".join(f"{s}:{a.get('status', 'ERR')}" for s, a in results.items())
     print(f"[{now:%H:%M:%S}] {src} | {board}")

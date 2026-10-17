@@ -10,6 +10,7 @@ Kite access tokens expire every morning (~06:00 IST), so the app asks you to log
 """
 import json
 import os
+import threading
 import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -31,14 +32,16 @@ INDEX_MAP = {"NIFTY": ("NSE", "NIFTY 50", "NIFTY", "NFO"), "BANKNIFTY": ("NSE", 
              "FINNIFTY": ("NSE", "NIFTY FIN SERVICE", "FINNIFTY", "NFO"), "SENSEX": ("BSE", "SENSEX", "SENSEX", "BFO")}
 MCX_MAP = {"CRUDE": "CRUDEOIL", "CRUDEOIL": "CRUDEOIL", "NATURALGAS": "NATURALGAS", "NATGAS": "NATURALGAS"}
 _last_call = {"hist": 0.0, "quote": 0.0}
+_throttle_lock = {k: threading.Lock() for k in _last_call}  # one per limiter: quote waits don't block history calls
 
 
 def _throttle(kind, gap):
-    """Kite limits: historical ~3 req/s, quote ~1 req/s."""
-    wait = _last_call[kind] + gap - time.time()
-    if wait > 0:
-        time.sleep(wait)
-    _last_call[kind] = time.time()
+    """Kite limits: historical ~3 req/s, quote ~1 req/s. Thread-safe (the scan runs on a thread pool)."""
+    with _throttle_lock[kind]:
+        wait = _last_call[kind] + gap - time.time()
+        if wait > 0:
+            time.sleep(wait)
+        _last_call[kind] = time.time()
 
 
 def credentials():

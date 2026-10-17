@@ -80,14 +80,21 @@ def _premium_now(a, t, now):
 INDEX_GROUP = {"NIFTY", "BANKNIFTY", "FINNIFTY", "SENSEX"}  # move together: same-direction trades are one bet
 
 
+def unrealized(df):
+    """Open-trade MTM ₹ per row (trades_df rows): after T1 half is booked at half_p, the rest marks at last_p."""
+    if df is None or not len(df):
+        return pd.Series(dtype=float)
+    return pd.Series(np.where(df.half == 1, (df.half_p - df.entry_p) * df.qty / 2 + (df.last_p - df.entry_p) * df.qty / 2,
+                              (df.last_p - df.entry_p) * df.qty), index=df.index, dtype=float)
+
+
 def risk_status(P, now):
     """Portfolio limits before opening anything new. -> dict(ok, reasons, pnl_today, open, limit)."""
     df = trades_df()
     today = now.date().isoformat()
     closed = df[(df.status == "CLOSED") & df.exit_at.fillna("").str.startswith(today)]
     opn = df[df.status == "OPEN"]
-    unreal = float(np.where(opn.half == 1, (opn.half_p - opn.entry_p) * opn.qty / 2 + (opn.last_p - opn.entry_p) * opn.qty / 2,
-                            (opn.last_p - opn.entry_p) * opn.qty).sum()) if len(opn) else 0.0
+    unreal = float(unrealized(opn).sum())
     pnl = float(closed.pnl.sum()) + unreal
     limit = P.get("capital", 0) * P.get("daily_loss_pct", 3.0) / 100
     reasons = []
@@ -186,22 +193,53 @@ def paper_step(results, P, now):
     return ev
 
 
+def _close_row(c, t, results, stamp, now, reason):
+    """Close one OPEN trade row at its current premium (live/model from the analysis, else last/entry premium).
+    Idempotent (WHERE status='OPEN'). -> (rowcount, pnl, prem, how)."""
+    a = (results or {}).get(t["symbol"])
+    if a and "error" not in a:
+        prem, how = _premium_now(a, t, now)
+    else:
+        prem, how = (t["last_p"] or t["entry_p"]), "last"
+    qty, half = t["qty"], t["half"] or 0
+    pnl = ((t["half_p"] - t["entry_p"]) * qty / 2 + (prem - t["entry_p"]) * qty / 2) if half else (prem - t["entry_p"]) * qty
+    risk = max((t["entry_p"] - t["sl0"]) * qty, 1e-9)
+    last_u = a["ltp"] if a and "error" not in a else t["last_u"]
+    n = c.execute("UPDATE trades SET status='CLOSED', exit_at=?, exit_p=?, exit_reason=?, pnl=?, r_mult=?, last_p=?, "
+                  "last_u=?, updated_at=? WHERE id=? AND status='OPEN'",
+                  (stamp, prem, reason, pnl, pnl / risk, prem, last_u, stamp, t["id"])).rowcount
+    return n, pnl, prem, how
+
+
 def close_all(results, now, reason="manual close"):
     """Close every open paper trade at its current premium."""
     c = conn()
     stamp = now.isoformat(timespec="seconds")
-    n = 0
-    for t in c.execute("SELECT * FROM trades WHERE status='OPEN'").fetchall():
-        a = results.get(t["symbol"])
-        prem = _premium_now(a, t, now)[0] if a and "error" not in a else (t["last_p"] or t["entry_p"])
-        qty, half = t["qty"], t["half"] or 0
-        pnl = ((t["half_p"] - t["entry_p"]) * qty / 2 + (prem - t["entry_p"]) * qty / 2) if half else (prem - t["entry_p"]) * qty
-        risk = max((t["entry_p"] - t["sl0"]) * qty, 1e-9)
-        n += c.execute("UPDATE trades SET status='CLOSED', exit_at=?, exit_p=?, exit_reason=?, pnl=?, r_mult=? "
-                       "WHERE id=? AND status='OPEN'", (stamp, prem, reason, pnl, pnl / risk, t["id"])).rowcount
+    n = sum(_close_row(c, t, results, stamp, now, reason)[0]
+            for t in c.execute("SELECT * FROM trades WHERE status='OPEN'").fetchall())
     c.commit()
     c.close()
     return n
+
+
+def close_trade(trade_id, results, now, reason="manual exit (paper)"):
+    """Paper exit of one open trade (no broker order). Logs an EXIT alert once. -> dict(id, symbol, pnl, prem, text)
+    or None when the trade is not open (already closed by the engine or another session)."""
+    c = conn()
+    t = c.execute("SELECT * FROM trades WHERE id=? AND status='OPEN'", (int(trade_id),)).fetchone()
+    out = None
+    if t:
+        n, pnl, prem, how = _close_row(c, t, results, now.isoformat(timespec="seconds"), now, reason)
+        if n == 1:
+            risk = max((t["entry_p"] - t["sl0"]) * t["qty"], 1e-9)
+            text = (f"{'🟢' if pnl > 0 else '🔴'} EXIT {t['symbol']} {t['strike']:g} {t['kind']} at {prem:.2f} ({how}): "
+                    f"{reason}. P&L ₹{pnl:,.0f} ({pnl / risk:+.2f}R)")
+            out = dict(id=t["id"], symbol=t["symbol"], pnl=pnl, prem=prem, text=text)
+    c.commit()
+    c.close()
+    if out:
+        notify([(f"exit:{out['id']}", out["symbol"], "EXIT", out["text"])], send=False)
+    return out
 
 
 def trades_df():
@@ -244,17 +282,44 @@ def log_recs(items, now, source):
     stamp, day = now.isoformat(timespec="seconds"), now.date().isoformat()
     n = 0
     for sym, r in items:
-        if not r or r.get("mode") not in ("now", "trigger"):
+        if not r or r.get("mode") not in ("now", "trigger", "blocked"):
             continue
         n += c.execute(
             "INSERT OR IGNORE INTO recs(ts, day, symbol, kind, mode, action, strike, prem, sl_p, t1_p, t2_p, u_entry, u_sl, "
             "u_t1, u_t2, conf, score, source, status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (stamp, day, sym, r["kind"], r["mode"], r["action"], r["strike"], r["prem"], r["sl"], r["t1"], r["t2"],
              r["u_entry"], r["u_sl"], r["u_t1"], r["u_t2"], r.get("conf"), r.get("score"), source,
-             "OPEN" if r["mode"] == "now" else "WAITING")).rowcount
+             "WAITING" if r["mode"] == "trigger" else "OPEN")).rowcount
     c.commit()
     c.close()
     return n
+
+
+def live_record(sym, kind, days=60):
+    """-> (target hits, resolved triggered calls) for one symbol/side over the last `days` days."""
+    c = conn()
+    since = (pd.Timestamp.now() - pd.Timedelta(days=days)).date().isoformat()
+    k, n = c.execute("SELECT SUM(status IN ('T1 HIT','T2 HIT')), COUNT(*) FROM recs WHERE symbol=? AND kind=? AND day>=? AND mode IN ('now','trigger') "
+                     "AND status IN ('T1 HIT','T2 HIT','STOP HIT','SQUARED OFF')", (sym, kind, since)).fetchone()
+    c.close()
+    return int(k or 0), int(n or 0)
+
+
+def add_broker_call(sym, side, entry, sl, t1, t2, source, now):
+    """Track an external intraday call (broker desk, TV, newsletter) against live prices with the same judge as the app's
+    own calls. ICICI-style: counted only if price trades within +/-0.25% of the entry ('not triggered' otherwise).
+    side 'BUY' / 'SELL'. -> True if added (one call per symbol/side/source/day)."""
+    src = "".join(ch for ch in str(source).strip() if ch.isalnum() or ch in " -_.&")[:40] or "unnamed"
+    c = conn()
+    n = c.execute(
+        "INSERT OR IGNORE INTO recs(ts, day, symbol, kind, mode, action, u_entry, u_sl, u_t1, u_t2, source, status) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        (now.isoformat(timespec="seconds"), now.date().isoformat(), sym.upper(), "CE" if side == "BUY" else "PE",
+         f"broker:{src}", f"{side} · {src}", float(entry), float(sl), float(t1), float(t2 or t1), f"broker:{src}",
+         "WAITING")).rowcount
+    c.commit()
+    c.close()
+    return bool(n)
 
 
 def _judge(rec, bars, sq_min):
@@ -266,12 +331,16 @@ def _judge(rec, bars, sq_min):
     t0 = pd.Timestamp(rec["ts"])
     b = bars[bars.index >= t0.floor("5min")]
     b = b[[d == t0.date() for d in b.index.date]]  # intraday: same session only
-    triggered = rec["mode"] == "now"
+    triggered = rec["mode"] in ("now", "blocked")
     trig_at, best, worst, hit1 = (rec["ts"] if triggered else None), 0.0, 0.0, None
     for ts, x in b.iterrows():
         mins = ts.hour * 60 + ts.minute
         if not triggered:
-            if (x.Close - entry) * dr >= 0 and mins < sq_min:
+            if str(rec["mode"]).startswith("broker"):  # entered only if price trades within +/-0.25% of the entry
+                hit = x.Low <= entry * 1.0025 and x.High >= entry * 0.9975
+            else:
+                hit = (x.Close - entry) * dr >= 0
+            if hit and mins < sq_min:
                 triggered, trig_at = True, ts.isoformat()
             continue
         fav, adv = (x.High, x.Low) if dr > 0 else (x.Low, x.High)
@@ -366,18 +435,128 @@ def send_telegram(text):
         return False
 
 
+def _secret(section, key):
+    try:
+        import streamlit as st
+        return st.secrets[section].get(key)
+    except Exception:
+        return None
+
+
+def ntfy_target():
+    """(server, topic) for ntfy.sh phone push ([ntfy] topic / env NTFY_TOPIC), or (None, None)."""
+    topic = os.environ.get("NTFY_TOPIC") or _secret("ntfy", "topic")
+    server = os.environ.get("NTFY_SERVER") or _secret("ntfy", "server") or "https://ntfy.sh"
+    return (server.rstrip("/"), topic) if topic else (None, None)
+
+
+def send_ntfy(text, title=None, tags=None, priority=None):
+    """Phone push through ntfy (install the ntfy app and subscribe to the topic). True when delivered."""
+    server, topic = ntfy_target()
+    if not topic:
+        return False
+    hdr = {k: v for k, v in (("Title", title), ("Tags", tags), ("Priority", priority)) if v}
+    try:
+        r = requests.post(f"{server}/{topic}", data=text.encode("utf-8"),
+                          headers={k: v.encode("utf-8").decode("latin-1") for k, v in hdr.items()}, timeout=8)
+        return r.ok
+    except Exception:
+        return False
+
+
+def push(text, title=None, tags=None, priority=None):
+    """Send to every configured channel (Telegram and/or ntfy). True if any delivered."""
+    a = send_telegram(text if not title else f"{title}\n{text}")
+    b = send_ntfy(text, title, tags, priority)
+    return a or b
+
+
+ALERT_TAGS = {"SIGNAL": "chart_with_upwards_trend", "ENTRY": "inbox_tray", "T1": "dart", "EXIT": "outbox_tray",
+              "NEWS": "newspaper"}
+
+
+def push_signals(items, now, min_grade="C", send=True):
+    """items: [(symbol, recommend() dict)]. One phone alert per symbol/side/day for each enter-now BUY CALL / BUY PUT
+    whose credibility grade is min_grade or better ("D" = every signal). -> newly logged events."""
+    rank = E.CRED_RANK
+    day = now.date().isoformat()
+    ev = []
+    for sym, r in items:
+        c = (r or {}).get("cred")
+        if not r or r.get("mode") != "now" or not c or rank[c["grade"]] > rank.get(min_grade, 2):
+            continue
+        ce = r["kind"] == "CE"
+        rr = r.get("rr")
+        text = (f"{'🟢 BUY CALL' if ce else '🔴 BUY PUT'} {sym} {r['strike']:g} {r['kind']}"
+                + (f" ({r['expiry']})" if r.get("expiry") else "")
+                + f"\nEntry ₹{r['prem']:.2f} · SL ₹{r['sl']:.2f} · T1 ₹{r['t1']:.2f} · T2 ₹{r['t2']:.2f}"
+                + ("" if r.get("live") else " (model premium)")
+                + f"\nUnderlying {r['u_entry']:,.2f} → SL {r['u_sl']:,.2f} · T1 {r['u_t1']:,.2f} · T2 {r['u_t2']:,.2f}"
+                + (f"\nR:R 1:{rr[0]:.1f} / 1:{rr[1]:.1f}" if rr else "")
+                + f"\nCredibility {c['grade']} ({c['score']}/100) · T1 odds {c['p_t1'] * 100:.0f}%"
+                + (f" · weak: {', '.join(c['fails'][:3])}" if c.get("fails") else "")
+                + (f"\n{r['invalid']}" if r.get("invalid") else "")
+                + "\nPaper/educational signal, not advice. Confirm on your broker's chain.")
+        ev.append((f"sig:{day}:{sym}:{r['kind']}", sym, "SIGNAL", text))
+    return notify(ev, send=send)
+
+
+def push_news(syms, now, send=True, hours=6):
+    """Phone alert once per filing for alert-worthy NSE announcements (order wins, acquisitions, buybacks, fund raising,
+    results, unusual-move clarifications) on these symbols in the last `hours`. -> newly logged events."""
+    try:
+        import news
+        a = news.announcements()
+    except Exception:
+        return []
+    if a.empty:
+        return []
+    x = a[a.alert & a.symbol.isin(set(syms)) & (a.ts >= now - pd.Timedelta(hours=hours))]
+    ev = [(f"news:{r.link}", r.symbol, "NEWS",
+           f"📰 {r.symbol}: {r.category} ({r.reading} usual reading)\n{r.subject}\nFiled {r.ts:%d %b %H:%M} · {r.link}\n"
+           f"Context only: news alone is not a reliable signal; wait for price confirmation.") for r in x.itertuples()]
+    return notify(ev, send=send)
+
+
+def push_horizons(syms, now, min_grade="B", fx=None, send=True):
+    """BTST / 2-day swing calls for these symbols, pushed once per symbol/horizon/day, only inside each market's
+    pre-close window and only when the setup's own 2-year record earns min_grade or better. -> newly logged events."""
+    import horizons as H
+    ev, day = [], now.date().isoformat()
+    for sym in syms:
+        spec = E.resolve(sym)
+        if not H.alert_window(spec, now):
+            continue
+        a = H.analyze(sym, fx if spec["kind"] == "commodity" else None)
+        if a.get("error"):
+            continue
+        for kind, x in a["setups"].items():
+            g, why = H.grade(x["rec"])
+            if not x["dir"] or E.CRED_RANK[g] > E.CRED_RANK.get(min_grade, 1):
+                continue
+            ce = x["dir"] > 0
+            lbl = {"BTST": "BTST", "SWING2D": "2-day breakout swing", "SWINGPB": "2-day pullback swing"}[kind]
+            text = (f"{'🟢 BUY CALL' if ce else '🔴 BUY PUT'} {sym} · {lbl} · grade {g}"
+                    f"\nClose {a['close']:,.2f} → T1 {x['t1']:,.2f} · SL {x['sl']:,.2f}"
+                    f"\n2-day range {a['range2d'][0]:,.2f} – {a['range2d'][1]:,.2f} (~80%)"
+                    f"\nRecord: {why}"
+                    f"\nOvernight gaps can skip the stop. Educational signal, not advice.")
+            ev.append((f"{kind}:{day}:{sym}:{x['dir']}", sym, "SIGNAL", text))
+    return notify(ev, send=send)
+
+
 def notify(events, send=True):
-    """Log each event once (UNIQUE key) and push new ones to Telegram. -> newly logged events."""
+    """Log each event once (UNIQUE key) and push new ones to the phone (Telegram / ntfy). -> newly logged events."""
     if not events:
         return []
     c, new = conn(), []
-    stamp = datetime.now().isoformat(timespec="seconds")
+    stamp = pd.Timestamp.now(tz=E.IST).isoformat(timespec="seconds")  # IST like trades (server may run in UTC)
     for key, sym, kind, text in events:
         cur = c.execute("INSERT OR IGNORE INTO alerts(ts, key, symbol, kind, text) VALUES(?,?,?,?,?)",
                         (stamp, key, sym, kind, text))
         if cur.rowcount:
             new.append((key, sym, kind, text))
-            if send and send_telegram(text):
+            if send and push(text, tags=ALERT_TAGS.get(kind), priority="high" if kind == "SIGNAL" else None):
                 c.execute("UPDATE alerts SET sent=1 WHERE key=?", (key,))
     c.commit()
     c.close()
@@ -386,6 +565,69 @@ def notify(events, send=True):
 
 def alerts_df(limit=100):
     c = conn()
-    df = pd.read_sql_query("SELECT ts, symbol, kind, text, sent FROM alerts ORDER BY id DESC LIMIT ?", c, params=(limit,))
+    df = pd.read_sql_query("SELECT id, ts, symbol, kind, text, sent FROM alerts ORDER BY id DESC LIMIT ?", c,
+                           params=(limit,))
+    c.close()
+    return df
+
+
+def alerts_since(last_id, limit=20):
+    """Alerts logged after id `last_id`, oldest first (the newest `limit`). -> list of dicts id, ts, key, symbol, kind, text."""
+    c = conn()
+    rows = c.execute("SELECT * FROM (SELECT id, ts, key, symbol, kind, text FROM alerts WHERE id>? ORDER BY id DESC "
+                     "LIMIT ?) ORDER BY id", (int(last_id or 0), limit)).fetchall()
+    c.close()
+    return [dict(r) for r in rows]
+
+
+def last_alert_id():
+    c = conn()
+    n = c.execute("SELECT COALESCE(MAX(id), 0) FROM alerts").fetchone()[0]
+    c.close()
+    return int(n)
+
+
+# ---------------- Option-chain history (for IV rank and OI build-up research) ----------------
+SNAP_SQL = """CREATE TABLE IF NOT EXISTS chain_snaps(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, day TEXT, symbol TEXT, source TEXT, expiry TEXT, spot REAL,
+  atm_iv REAL, pcr REAL, pcr_chg REAL, call_wall REAL, put_wall REAL, max_pain REAL, strikes TEXT)"""
+SNAP_EVERY_MIN = 15
+
+
+def save_chain_snaps(results, now, width=10):
+    """Store each symbol's option chain (summary + the +/-width strikes around spot) at most every 15 minutes.
+    Builds the history that IV-rank and OI build-up signals need before they can be back-tested. -> rows saved."""
+    c = conn()
+    c.execute(SNAP_SQL)
+    c.execute("CREATE INDEX IF NOT EXISTS ix_snaps ON chain_snaps(symbol, ts)")
+    stamp, n = now.isoformat(timespec="seconds"), 0
+    cutoff = (now - pd.Timedelta(minutes=SNAP_EVERY_MIN - 1)).isoformat(timespec="seconds")
+    for sym, a in results.items():
+        ch = (a or {}).get("chain")
+        if not ch or not ch.get("quotes") or "error" in a:
+            continue
+        if c.execute("SELECT 1 FROM chain_snaps WHERE symbol=? AND ts>=?", (sym, cutoff)).fetchone():
+            continue
+        spot = float(a["ltp"])
+        ks = sorted(ch["quotes"])
+        i = min(range(len(ks)), key=lambda j: abs(ks[j] - spot))
+        near = {f"{k:g}": ch["quotes"][k] for k in ks[max(0, i - width): i + width + 1]}
+        c.execute("INSERT INTO chain_snaps(ts, day, symbol, source, expiry, spot, atm_iv, pcr, pcr_chg, call_wall, put_wall, "
+                  "max_pain, strikes) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                  (stamp, now.date().isoformat(), sym, ch.get("source"), ch.get("expiry"), spot, ch.get("atm_iv"),
+                   ch.get("pcr"), ch.get("pcr_chg"), ch.get("call_wall"), ch.get("put_wall"), ch.get("max_pain"),
+                   json.dumps(near, default=float)))
+        n += 1
+    c.commit()
+    c.close()
+    return n
+
+
+def chain_history(symbol, days=365):
+    """-> DataFrame of saved snapshots for one symbol (newest last)."""
+    c = conn()
+    c.execute(SNAP_SQL)
+    since = (pd.Timestamp.now() - pd.Timedelta(days=days)).date().isoformat()
+    df = pd.read_sql_query("SELECT * FROM chain_snaps WHERE symbol=? AND day>=? ORDER BY ts", c, params=(symbol, since))
     c.close()
     return df

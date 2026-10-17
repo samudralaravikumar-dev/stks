@@ -29,7 +29,9 @@ SCHEMA = """CREATE TABLE IF NOT EXISTS users(
 CREATE TABLE IF NOT EXISTS watchlists(username TEXT PRIMARY KEY, symbols TEXT, updated TEXT);
 CREATE TABLE IF NOT EXISTS sessions(token_hash TEXT PRIMARY KEY, username TEXT, created TEXT, expires TEXT, last_seen TEXT);
 CREATE TABLE IF NOT EXISTS otps(
-  mobile TEXT, code_hash TEXT, expires TEXT, tries INTEGER DEFAULT 0, sent_at TEXT, used INTEGER DEFAULT 0)"""
+  mobile TEXT, code_hash TEXT, expires TEXT, tries INTEGER DEFAULT 0, sent_at TEXT, used INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS watchlist_sets(username TEXT, slot INTEGER, name TEXT, symbols TEXT, updated TEXT,
+  PRIMARY KEY(username, slot))"""
 
 
 def _conn():
@@ -151,13 +153,34 @@ def revoke_all_sessions(username):
 
 
 def _cookie_js(value, max_age):
-    """Set/clear the session cookie from a tiny same-origin iframe (Streamlit can read cookies but not set them).
+    """Set/clear the session cookie from a tiny same-origin iframe (Streamlit can read cookies but not set them),
+    mirrored in localStorage so a browser that drops the cookie can restore it (see _restore_js).
     The value is our own urlsafe token (or empty), never user input."""
     value = "".join(ch for ch in value if ch.isalnum() or ch in "-_")
     st.iframe(
-        f"<script>try{{const d=window.parent.document||document;d.cookie='{COOKIE}={value}; Max-Age={int(max_age)}; "
-        f"Path=/; SameSite=Lax'+(window.parent.location.protocol==='https:'?'; Secure':'');}}catch(e){{"
-        f"document.cookie='{COOKIE}={value}; Max-Age={int(max_age)}; Path=/; SameSite=Lax';}}</script>", height=1)
+        f"<script>try{{const w=window.parent;w.document.cookie='{COOKIE}={value}; Max-Age={int(max_age)}; "
+        f"Path=/; SameSite=Lax'+(w.location.protocol==='https:'?'; Secure':'');"
+        f"try{{'{value}'?w.localStorage.setItem('{COOKIE}','{value}'):w.localStorage.removeItem('{COOKIE}');"
+        f"w.sessionStorage.removeItem('{COOKIE}_tried');}}catch(e){{}}"
+        f"}}catch(e){{document.cookie='{COOKIE}={value}; Max-Age={int(max_age)}; Path=/; SameSite=Lax';}}</script>",
+        height=1)
+
+
+def _restore_js():
+    """Login screen only: when the cookie is gone but localStorage still holds the token (mobile browsers can drop
+    cookies on pull-to-refresh or when a tab is evicted), put it back and reload once. sessionStorage guards loops."""
+    st.iframe(
+        f"<script>try{{const w=window.parent,t=w.localStorage.getItem('{COOKIE}');"
+        f"const has=w.document.cookie.split('; ').some(c=>c.startsWith('{COOKIE}='));"
+        f"if(t&&!has&&!w.sessionStorage.getItem('{COOKIE}_tried')){{w.sessionStorage.setItem('{COOKIE}_tried','1');"
+        f"w.document.cookie='{COOKIE}='+t+'; Max-Age={SESSION_DAYS * 86400}; Path=/; SameSite=Lax'"
+        f"+(w.location.protocol==='https:'?'; Secure':'');w.location.reload();}}}}catch(e){{}}</script>", height=1)
+
+
+def _no_pull_refresh():
+    """Mobile: dragging down at the top of the page reloads it (pull-to-refresh). Keep drags as scrolls."""
+    st.markdown("<style>html,body,[data-testid='stApp'],[data-testid='stAppViewContainer'],[data-testid='stMain']"
+                "{overscroll-behavior-y:none}</style>", unsafe_allow_html=True)
 
 
 def _remember(user):
@@ -175,12 +198,46 @@ def get_watchlist(username):
     return [s for s in (r["symbols"] if r else "").split(",") if s] if r else None
 
 
+def _clean(syms):
+    """Upper-case, de-duplicated, at most 40 symbols."""
+    return list(dict.fromkeys(s.strip().upper() for s in (syms or []) if s and s.strip()))[:40]
+
+
 def set_watchlist(username, syms):
-    clean = list(dict.fromkeys(s.strip().upper() for s in syms if s and s.strip()))[:40]
+    """The active list (legacy single row: the app's sidebar list and SYMBOLS)."""
+    clean = _clean(syms)
     with _conn() as c:
         c.execute("INSERT INTO watchlists(username, symbols, updated) VALUES(?,?,?) ON CONFLICT(username) DO UPDATE "
                   "SET symbols=excluded.symbols, updated=excluded.updated",
                   (username.lower(), ",".join(clean), datetime.now().isoformat(timespec="seconds")))
+    return clean
+
+
+def get_watchlist_sets(username):
+    """Numbered watchlists 1-5 -> {slot: dict(name, symbols)}. The first call seeds slot 1 from the legacy list."""
+    u = username.lower()
+    with _conn() as c:
+        rows = c.execute("SELECT slot, name, symbols FROM watchlist_sets WHERE username=?", (u,)).fetchall()
+    if not rows:
+        legacy = get_watchlist(u)
+        if legacy is None:
+            return {}
+        set_watchlist_slot(u, 1, legacy)
+        return {1: dict(name=None, symbols=_clean(legacy))}
+    return {int(r["slot"]): dict(name=r["name"] or None, symbols=[s for s in (r["symbols"] or "").split(",") if s])
+            for r in rows}
+
+
+def set_watchlist_slot(username, slot, syms, name=None):
+    """Save one numbered list (same clean / de-dupe / 40 cap as set_watchlist); name=None keeps the saved name,
+    '' clears it."""
+    clean = _clean(syms)
+    nm = None if name is None else str(name).strip()[:24]
+    with _conn() as c:
+        c.execute("INSERT INTO watchlist_sets(username, slot, name, symbols, updated) VALUES(?,?,?,?,?) "
+                  "ON CONFLICT(username, slot) DO UPDATE SET symbols=excluded.symbols, updated=excluded.updated, "
+                  "name=COALESCE(excluded.name, watchlist_sets.name)",
+                  (username.lower(), int(slot), nm, ",".join(clean), datetime.now().isoformat(timespec="seconds")))
     return clean
 
 
@@ -350,12 +407,19 @@ def set_role(username, role):
 def gate():
     """Render login / first-run setup until authenticated. -> user dict (stops the script otherwise).
     A remember-me cookie keeps the user signed in across reloads, reconnects and app restarts until Log out."""
+    _no_pull_refresh()
     if st.session_state.get("cookie_clear"):
         _cookie_js("", 0)
         st.session_state.pop("cookie_clear", None)
     if st.session_state.get("user"):
-        if st.session_state.get("cookie_pending"):
-            _cookie_js(st.session_state.pop("cookie_pending"), SESSION_DAYS * 86400)
+        pending = st.session_state.pop("cookie_pending", None)
+        if pending or not st.session_state.get("cookie_synced"):
+            # once per browser session: repairs a cookie write that didn't stick and renews its 30-day Max-Age
+            # (the server-side expiry slides on every visit, the cookie's did not)
+            tok = pending or st.session_state.get("session_token")
+            if tok:
+                _cookie_js(tok, SESSION_DAYS * 86400)
+            st.session_state["cookie_synced"] = True
         return st.session_state["user"]
     try:
         tok = st.context.cookies.get(COOKIE)
@@ -367,7 +431,13 @@ def gate():
     if u:
         st.session_state["user"] = u
         st.session_state["session_token"] = tok
+        _cookie_js(tok, SESSION_DAYS * 86400)  # renew Max-Age and the localStorage copy, reset the restore guard
+        st.session_state["cookie_synced"] = True
         return u
+    if tok:
+        _cookie_js("", 0)  # revoked or expired token: clear it (and its localStorage copy) so restore can't loop
+    else:
+        _restore_js()
     _, mid, _ = st.columns([1, 1.2, 1])
     with mid:
         st.markdown("## 📈 Intraday CALL / PUT Engine")
@@ -433,7 +503,7 @@ def logout():
         revoke_session(st.context.cookies.get(COOKIE))
     except Exception:
         pass
-    for k in ("user", "last_results", "session_token", "cookie_pending"):
+    for k in ("user", "last_results", "session_token", "cookie_pending", "cookie_synced"):
         st.session_state.pop(k, None)
     st.session_state["cookie_clear"] = True
     st.rerun()

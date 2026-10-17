@@ -35,6 +35,7 @@ from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
 import events
 import kite_feed as kf
+import net
 import upstox_feed as uf
 
 
@@ -109,7 +110,11 @@ def _flat(df):
 
 @st.cache_data(ttl=60, show_spinner=False)
 def load_prices(ticker, interval, period):
-    return _flat(yf.download(ticker, interval=interval, period=period, auto_adjust=True, progress=False)).dropna()
+    # Ticker.history, not yf.download: download() shares global state and is unsafe from the scan thread pool
+    try:
+        return _flat(yf.Ticker(ticker).history(interval=interval, period=period, auto_adjust=True)).dropna()
+    except Exception:  # history() re-raises rate limits (429) that download() swallowed: keep the empty-frame contract
+        return pd.DataFrame()
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -148,13 +153,10 @@ def nse_chain(sym, is_index):
     """Nearest-expiry chain from NSE's v3 API (unofficial; returns None on failure).
     Gives PCR, OI walls, max pain, ATM IV, live quotes per strike, strike step and lot size."""
     try:
-        s = requests.Session()
-        s.get("https://www.nseindia.com/option-chain", headers=NSE_H, timeout=8)
         q = urllib.parse.quote(sym)
-        expiry = s.get(f"https://www.nseindia.com/api/option-chain-contract-info?symbol={q}",
-                       headers=NSE_H, timeout=8).json()["expiryDates"][0]
-        j = s.get(f"https://www.nseindia.com/api/option-chain-v3?type={'Indices' if is_index else 'Equity'}"
-                  f"&symbol={q}&expiry={expiry}", headers=NSE_H, timeout=8).json()
+        expiry = net.nse_get(f"https://www.nseindia.com/api/option-chain-contract-info?symbol={q}", NSE_H)["expiryDates"][0]
+        j = net.nse_get(f"https://www.nseindia.com/api/option-chain-v3?type={'Indices' if is_index else 'Equity'}"
+                        f"&symbol={q}&expiry={expiry}", NSE_H)
         und = float(j["records"]["underlyingValue"])
         quotes, qtys = {}, []
         for x in j["records"]["data"]:
@@ -327,6 +329,40 @@ def add_indicators(df, has_vol):
 PILLARS = ["Moving averages", "RSI", "MACD", "Volume", "Bollinger/ATR", "Support/Resistance"]
 PILLAR_SHORT = {"Moving averages": "①MA", "RSI": "②RSI", "MACD": "③MACD", "Volume": "④Vol",
                 "Bollinger/ATR": "⑤BB/ATR", "Support/Resistance": "⑥S/R"}
+# Confirmation gates (not votes): as extra score votes they changed nothing in a 30-symbol, 60-day back-test, but as
+# filters all three together cut the loss per trade from -0.065R to -0.011R and lifted T1 hits 22% -> 26%, in both
+# halves of the sample. They do not by themselves create a proven edge.
+CTX_FILTERS = {"mkt": "NIFTY 50 trend agrees", "rs": "Beats (CALL) / lags (PUT) NIFTY 50 today",
+               "d1": "Daily trend agrees (close vs 20-day EMA)", "macd": "MACD histogram agrees"}
+# macd: the only one of 17 further technical gates that improved both the selection (Jun-Sep) and the unseen
+# (Sep-Oct) period in a 40-symbol, 120-day walk-forward test (-0.092 -> -0.082R and +0.063 -> +0.088R per trade).
+CTX_DEFAULT = ("mkt", "rs", "d1", "macd")
+# Partial target (R multiples of the stop distance). Option-priced walk-forward test, 41 symbols x 120 days: book half
+# at 0.5R then run to the final target with the stop at breakeven -> win rate 47% -> 60% (IV x1.1-1.6 alike), train
+# half -1.0% -> +0.1% of premium per trade, all-period average +3.1% -> +2.6%. Higher success rate, similar profit.
+T1_R = 0.5
+
+
+def add_market_context(d, bench):
+    """Market confirmation, relative strength and daily trend (completed bars only, no look-ahead).
+    bench: NIFTY 50 closes on the same timeframe (None for NIFTY itself and for commodities).
+    MKT: NIFTY trend +1/-1/0 · RS: session % change minus NIFTY's (points) · D1: last daily close vs 20-day EMA."""
+    c = d.Close
+    d["D1"] = htf_trend(c, "1D", span=20)  # last completed daily close vs its 20-day EMA
+    if bench is None or len(bench) < 30:
+        d["RS"], d["MKT"] = np.nan, 0.0
+        return d
+    b = bench[~bench.index.duplicated()].sort_index()
+    bday = pd.Series(b.index.date, index=b.index)
+    b_pdc = bday.map(b.groupby(b.index.date).last().shift(1))  # NIFTY previous close per bar
+    b_chg = (b / b_pdc - 1).reindex(d.index, method="ffill")
+    same_day = pd.Series(b.index.date, index=b.index).reindex(d.index, method="ffill") == pd.Series(d.index.date,
+                                                                                                    index=d.index)
+    d["RS"] = ((c / d.PDC - 1) - b_chg).where(same_day) * 100  # session % change vs NIFTY's, in points
+    e9, e21 = b.ewm(span=9, adjust=False).mean(), b.ewm(span=21, adjust=False).mean()
+    mkt = pd.Series(np.where((e9 > e21) & (b > e21), 1.0, np.where((e9 < e21) & (b < e21), -1.0, 0.0)), index=b.index)
+    d["MKT"] = mkt.reindex(d.index, method="ffill").where(same_day).fillna(0.0)
+    return d
 
 
 def build_votes(d, has_vol):
@@ -411,9 +447,10 @@ def entry_window(spec, P):
     return tmin(op) + 15, tmin(sq) - 30
 
 
-def compute(df, spec, P, has_vol):
-    """Indicators + votes + setups + regime -> Signal (+1 CALL / -1 PUT / 0) for every closed bar."""
-    d = add_indicators(df, has_vol)
+def compute(df, spec, P, has_vol, bench=None):
+    """Indicators + votes + setups + regime -> Signal (+1 CALL / -1 PUT / 0) for every closed bar.
+    bench: NIFTY 50 closes on the same timeframe for the market/relative-strength votes (optional)."""
+    d = add_market_context(add_indicators(df, has_vol), bench)
     votes = build_votes(d, has_vol)
     for pil in PILLARS:
         d["P_" + pil] = sum((w * (b.eq(True).astype(float) - r.eq(True).astype(float))
@@ -435,6 +472,24 @@ def compute(df, spec, P, has_vol):
     ok = d.InWin & ~d.Ext & (d.Regime != "Range")
     long = ok & (d.TDir > 0) & (d.Score >= d.Need) & (d.HTF15 >= 0)
     short = ok & (d.TDir < 0) & (d.Score <= -d.Need) & (d.HTF15 <= 0)
+    # Confirmation gates (CTX_FILTERS): the trade must not fight NIFTY's trend, must lead/lag NIFTY, and must agree
+    # with the daily trend. Missing data (NIFTY itself, commodities, short history) never blocks.
+    gate_l, gate_s = {}, {}
+    for f in P.get("ctx_filter", CTX_DEFAULT):
+        x = d[{"mkt": "MKT", "rs": "RS", "d1": "D1", "macd": "MACDh"}[f]]
+        if f in ("rs", "macd"):  # strictly on the trade's side
+            gate_l[f], gate_s[f] = (x > 0) | x.isna(), (x < 0) | x.isna()
+        else:  # neutral (0) allowed
+            gate_l[f], gate_s[f] = x.fillna(0) >= 0, x.fillna(0) <= 0
+    pre_l, pre_s = long.copy(), short.copy()
+    for f in gate_l:
+        long &= gate_l[f]
+        short &= gate_s[f]
+    d["CtxBlock"] = ""
+    for f in gate_l:  # name the checks that stopped an otherwise valid signal
+        hit = (pre_l & ~gate_l[f]) | (pre_s & ~gate_s[f])
+        d.loc[hit, "CtxBlock"] = d.loc[hit, "CtxBlock"] + "; " + CTX_FILTERS[f]
+    d["CtxBlock"] = d.CtxBlock.str.lstrip("; ")
     rng = d.InWin & (d.Regime == "Range")
     mrl = rng & (d.MDir > 0) & (d.Score > -P["th"] / 2)
     mrs = rng & (d.MDir < 0) & (d.Score < P["th"] / 2)
@@ -469,15 +524,20 @@ def bs(S, K, T, sig, kind, r=0.065):
     return K * exp(-r * T) * N(-d2) - S * N(-d1), N(d1) - 1
 
 
+def realized_vol(d, spec, interval):
+    """Annualised intraday realized volatility (overnight gaps excluded); 0 when there are too few bars."""
+    op, cl, _ = SESSIONS[spec["sess"]]
+    bars_day = (tmin(cl) - tmin(op)) / int(interval[:-1])
+    lr = np.log(d.Close).diff()[pd.Series(d.index.date, index=d.index).eq(pd.Series(d.index.date, index=d.index).shift())]
+    return float(lr.std() * sqrt(bars_day * 252)) if lr.notna().sum() > 20 else 0.0
+
+
 def estimate_iv(spec, d, P, chain, vix, interval):
     if P["iv"]:
         return P["iv"] / 100, "manual"
     if chain and chain.get("atm_iv"):
         return chain["atm_iv"], "NSE ATM IV"
-    op, cl, _ = SESSIONS[spec["sess"]]
-    bars_day = (tmin(cl) - tmin(op)) / int(interval[:-1])
-    lr = np.log(d.Close).diff()[pd.Series(d.index.date, index=d.index).eq(pd.Series(d.index.date, index=d.index).shift())]
-    rv = float(lr.std() * sqrt(bars_day * 252)) if lr.notna().sum() > 20 else 0.0
+    rv = realized_vol(d, spec, interval)
     if spec["kind"] == "index" and vix:
         return vix / 100 * (1.2 if spec["name"] == "BANKNIFTY" else 1.0), "India VIX"
     floor = {"index": 0.12, "stock": 0.20, "commodity": 0.25}[spec["kind"]]
@@ -499,7 +559,7 @@ def pick_strike(entry, kind, T, iv, r, chain, spec, P):
         strikes = sorted(chain["quotes"])
     else:
         atm0 = round(entry / step) * step
-        strikes = [atm0 + k * step for k in range(-10, 11)]
+        strikes = [atm0 + k * step for k in range(-10, 11) if atm0 + k * step > 0] or [step]
     i = strikes.index(min(strikes, key=lambda k: abs(k - entry)))
     near = strikes[max(0, i - 10): i + 11]
     if P["strike_mode"] == "Delta target":
@@ -521,7 +581,9 @@ def option_plan(spec, row, ltp, P, chain, iv, now):
     kind = "CE" if dr > 0 else "PE"
     R = float(row.StopDist)
     entry = ltp
-    stop, t1, t2 = entry - dr * R, entry + dr * R, entry + dr * float(row.T2Dist)
+    # T1 (book half, stop to breakeven) at T1_R x the stop distance: 0.5R lifted the option win rate from ~47% to
+    # ~60% in a 41-symbol, 120-day option-priced test, positive in both halves (see T1_R)
+    stop, t1, t2 = entry - dr * R, entry + dr * P.get("t1_r", T1_R) * R, entry + dr * float(row.T2Dist)
     notes = []
     dte = option_dte(chain, P, now)
     if chain:
@@ -602,6 +664,11 @@ def price_targets(row, ltp, iv, chain, spec, now, n=3):
             ("Swing high", row.SwingHi), ("Swing low", row.SwingLo), ("VWAP +2σ", row.VWAPu), ("VWAP −2σ", row.VWAPl),
             ("VWAP", row.VWAP), ("IV +1σ to close", ltp + em), ("IV −1σ to close", ltp - em),
             ("IV +2σ to close", ltp + 2 * em), ("IV −2σ to close", ltp - 2 * em)]
+    pdr = row.PDH - row.PDL  # Fibonacci retracements / extensions of the previous day's range
+    if pd.notna(pdr) and pdr > 0:
+        cand += [(f"Fib {f * 100:.1f}%", row.PDL + f * pdr) for f in (0.382, 0.5, 0.618)]
+        cand += [(f"Fib ext {(1 + f) * 100:.1f}%", row.PDH + f * pdr) for f in (0.272, 0.618)]
+        cand += [(f"Fib ext −{(1 + f) * 100:.1f}%", row.PDL - f * pdr) for f in (0.272, 0.618)]
     if chain:
         cand += [("Call-OI wall", chain["call_wall"]), ("Put-OI wall", chain["put_wall"]), ("Max pain", chain["max_pain"])]
     cand = [(lbl, float(v)) for lbl, v in cand if pd.notna(v) and v > 0]
@@ -661,7 +728,7 @@ def side_analysis(spec, row, ltp, P, chain, iv, now, tg):
         verdict = "PUT favoured"
     else:
         verdict = "Neither: no clear edge (theta decays both sides)"
-    why.append(f"Six-group score {s:+.1f} vs ±{need:.1f} needed")
+    why.append(f"Confluence score {s:+.1f} vs ±{need:.1f} needed")
     if chain and chain["pcr"]:
         why.append(f"PCR {chain['pcr']:.2f}: " + ("put writers active (supportive)" if chain["pcr"] > 1.1
                                                  else "call writers active (capping)" if chain["pcr"] < 0.8 else "balanced"))
@@ -720,7 +787,10 @@ def fetch_news(query, ticker, limit=8):
     out, seen, a = [], set(), sentiment_analyzer()
     for src, url in FEEDS.items():
         try:
-            feed = feedparser.parse(url.format(q=urllib.parse.quote(query), t=urllib.parse.quote(ticker)))
+            # fetch with a timeout (feedparser's own fetch has none, so one hung feed could stall the whole scan)
+            r = net.session().get(url.format(q=urllib.parse.quote(query), t=urllib.parse.quote(ticker)), timeout=6,
+                                  headers={"User-Agent": NSE_H["User-Agent"]})
+            feed = feedparser.parse(r.content)
             for e in feed.entries[:limit]:
                 k = e.get("title", "").lower()[:60]
                 if k and k not in seen:
@@ -734,7 +804,7 @@ def fetch_news(query, ticker, limit=8):
 
 # ---------------- Backtest (trade-level, same signals as live) ----------------
 def backtest(d, spec, P):
-    """Enter next bar's open; stop checked before target inside a bar (conservative); book 50% at 1R and move the
+    """Enter next bar's open; stop checked before target inside a bar (conservative); book 50% at T1 (T1_R, default 0.5R) and move the
     stop to breakeven; rest at T2, Supertrend trail/flip, or square-off time. Results in R multiples after costs."""
     o, h, l, c = (d[x].to_numpy() for x in ("Open", "High", "Low", "Close"))
     sig, dist, t2d = d.Signal.to_numpy(), d.StopDist.to_numpy(), d.T2Dist.to_numpy()
@@ -753,7 +823,7 @@ def backtest(d, spec, P):
             if days[i] == pend["day"] and mins[i] < sqm:
                 e, dr, R = o[i], pend["dir"], pend["dist"]
                 run = pend["typ"] == "trend" and P["exit_mode"] == "Run to close"
-                pos = dict(dir=dr, entry=e, R=R, stop=e - dr * R, t1=e + dr * R,
+                pos = dict(dir=dr, entry=e, R=R, stop=e - dr * R, t1=e + dr * P.get("t1_r", T1_R) * R,
                            t2=e + dr * (1e9 if run else pend["t2d"]), half=False,
                            booked=0.0, t_in=idx[i], setup=pend["setup"], typ=pend["typ"])
                 per_day[days[i]] = per_day.get(days[i], 0) + 1
@@ -799,25 +869,170 @@ def backtest(d, spec, P):
                    avg_loss=t.R[t.R < 0].mean() if (t.R < 0).any() else 0.0)
 
 
+# ---------------- Option-priced back-test ----------------
+def next_expiry(ts, weekly, mcx_day=None):
+    """Next expiry 15:30 IST: Tuesday weekly (NIFTY), the month's last Tuesday (NSE monthly), or for MCX options the
+    month's mcx_day (~17th crude, ~24th natural gas; approximate). Holiday shifts ignored."""
+    d = ts.normalize().tz_localize(None)
+    if mcx_day:
+        e = d.replace(day=mcx_day)
+        e = e if e >= d else (d.replace(day=1) + pd.offsets.MonthBegin(1)).replace(day=mcx_day)
+        return (e + pd.Timedelta(hours=17)).tz_localize(IST)
+    if weekly:
+        e = d + pd.Timedelta(days=(1 - d.weekday()) % 7)
+    else:
+        e = None
+        for m in range(3):
+            first = d.replace(day=1) + pd.offsets.MonthBegin(m) if m else d.replace(day=1)
+            last = first + pd.offsets.MonthEnd(0)
+            cand = last - pd.Timedelta(days=(last.weekday() - 1) % 7)
+            if cand >= d:
+                e = cand
+                break
+    return (e + pd.Timedelta(hours=15, minutes=30)).tz_localize(IST)
+
+
+def option_backtest(d, spec, P, ivr=1.3, cost=0.015):
+    """The same signals and exits as backtest(), scored on a delta-0.55 option's premium: Black-Scholes with IV =
+    trailing 5-session realized vol x ivr (held constant), next weekly/monthly expiry, 1.5% round-trip cost.
+    -> (trades DataFrame with pnl as a fraction of premium, stats dict or None). A model, not real option prices."""
+    o, h, l, c = (d[x].to_numpy() for x in ("Open", "High", "Low", "Close"))
+    sig, dist, t2d = d.Signal.to_numpy(), d.StopDist.to_numpy(), d.T2Dist.to_numpy()
+    idx, n = d.index, len(d)
+    days = np.array(idx.date)
+    mins = (idx.hour * 60 + idx.minute).to_numpy()
+    sqm = tmin(SESSIONS[spec["sess"]][2])
+    lr = np.log(d.Close).diff().where(pd.Series(days, index=idx).eq(pd.Series(days, index=idx).shift()))
+    bpd = max(1, (tmin(SESSIONS[spec["sess"]][1]) - tmin(SESSIONS[spec["sess"]][0])) // int(P["interval"][:-1]))
+    vol = (lr.rolling(bpd * 5, min_periods=bpd * 2).std() * sqrt(bpd * 252)).bfill().to_numpy()
+    r = 0.0 if spec["kind"] == "commodity" else 0.065
+    weekly = spec["name"] == "NIFTY"
+    mcx_day = (17 if "CRUDE" in spec["name"] else 24) if spec["kind"] == "commodity" else None
+    step = spec["step"] or auto_step(float(c[-1]))
+    yrs = lambda t, exp: max((exp - t).total_seconds() / 86400 / 365, 1 / 365 / 48)
+    t1r = P.get("t1_r", T1_R)
+    out, i, per_day = [], 0, {}
+    while i < n - 1:
+        if sig[i] == 0 or days[i + 1] != days[i] or per_day.get(days[i], 0) >= P["max_day"] or mins[i + 1] >= sqm:
+            i += 1
+            continue
+        dr, j0 = int(sig[i]), i + 1
+        kind, S0, R = ("CE" if dr > 0 else "PE"), o[j0], dist[i]
+        exp, iv = next_expiry(idx[j0], weekly, mcx_day), max(vol[i] * ivr, 0.08)
+        atm = round(S0 / step) * step
+        K = min((atm + k * step for k in range(-8, 9) if atm + k * step > 0),
+                key=lambda k: abs(abs(bs(S0, k, yrs(idx[j0], exp), iv, kind, r)[1]) - P["delta"]))
+        prem = lambda S, t: bs(S, K, yrs(t, exp), iv, kind, r)[0]
+        p0 = prem(S0, idx[j0])
+        if p0 <= 0.5:
+            i += 1
+            continue
+        per_day[days[i]] = per_day.get(days[i], 0) + 1
+        sl_u, t1_u, t2_u = S0 - dr * R, S0 + dr * t1r * R, S0 + dr * t2d[i]
+        half, booked, exit_p, why, j = False, 0.0, None, "", j0
+        while j < n and days[j] == days[j0]:
+            adv, fav = (l[j], h[j]) if dr > 0 else (h[j], l[j])
+            stop_lvl = S0 if half else sl_u
+            if (adv - stop_lvl) * dr <= 0:
+                exit_p, why = prem(stop_lvl if (o[j] - stop_lvl) * dr >= 0 else o[j], idx[j]), "breakeven" if half else "stop"
+            else:
+                if not half and (fav - t1_u) * dr >= 0:
+                    half, booked = True, 0.5 * (prem(t1_u, idx[j]) - p0)
+                if (fav - t2_u) * dr >= 0:
+                    exit_p, why = prem(t2_u, idx[j]), "target"
+                elif mins[j] >= sqm or j + 1 >= n or days[j + 1] != days[j]:
+                    exit_p, why = prem(c[j], idx[j]), "square-off"
+            if exit_p is not None:
+                break
+            j += 1
+        if exit_p is None:
+            break
+        pnl = (booked + (0.5 if half else 1.0) * (exit_p - p0)) / p0 - cost
+        out.append(dict(entry_time=idx[j0], side="CALL" if dr > 0 else "PUT", strike=K, prem=round(p0, 2), iv=iv,
+                        dte=round((exp - idx[j0]).total_seconds() / 86400, 1), exit_reason=why, t1_hit=half,
+                        pnl_pct=round(pnl * 100, 2)))
+        i = j + 1
+    t = pd.DataFrame(out)
+    if t.empty:
+        return t, None
+    # Under a day to expiry a constant-IV model badly overstates option gains (real expiry-day IV and spreads move
+    # against the buyer), so those trades stay in the list but are left out of the statistics
+    p = t.pnl_pct[t.dte >= 1] / 100
+    if p.empty:
+        return t, None
+    loss = -p[p < 0].sum()
+    return t, dict(trades=len(p), win=float((p > 0).mean()), avg=float(p.mean()), t1=float(t.t1_hit[t.dte >= 1].mean()),
+                   floor=float(p.mean() - 1.645 * p.std(ddof=1) / sqrt(len(p))) if len(p) > 1 else -1.0,
+                   pf=float(p[p > 0].sum() / loss) if loss > 0 else float("inf"))
+
+
 # ---------------- Chart ----------------
-def make_chart(d, name, spec, has_vol):
+CHART_OVERLAYS = ("EMA", "VWAP", "Supertrend", "OR", "PDH/PDL", "Signals")  # make_chart(overlays=...) names
+_OV_LINES = {"EMA": ("EMA9", "EMA21"), "VWAP": ("VWAP", "VWAPu", "VWAPl"), "OR": ("ORH", "ORL"), "PDH/PDL": ("PDH", "PDL")}
+
+
+def make_chart(d, name, spec, has_vol, levels=None, compact=False, overlays=None):
+    """Candles + overlays; the full stack adds volume, confluence, RSI, MACD and ADX panes (980px).
+    compact: price (+ volume) only, 560px, dark. overlays: CHART_OVERLAYS names to draw (None = all).
+    levels: [(label, price, colour, dash[, note])] drawn as right-labelled lines on the price pane; levels far outside
+    the visible bars are skipped and their labels listed in fig.layout.meta['off']."""
     x = d.tail(220).copy()
     x.index = x.index.tz_localize(None)
-    rows = 6 if has_vol else 5
-    heights = [.42, .1, .12, .12, .12, .12][:rows] if has_vol else [.46, .12, .14, .14, .14]
+    on = (lambda k: True) if overlays is None else (lambda k: k in overlays)
+    if compact:
+        rows, heights = (2, [.8, .2]) if has_vol else (1, [1])
+    else:
+        rows = 6 if has_vol else 5
+        heights = [.42, .1, .12, .12, .12, .12][:rows] if has_vol else [.46, .12, .14, .14, .14]
     fig = make_subplots(rows=rows, cols=1, shared_xaxes=True, row_heights=heights, vertical_spacing=.015)
     fig.add_trace(go.Candlestick(x=x.index, open=x.Open, high=x.High, low=x.Low, close=x.Close, name=name), 1, 1)
     for col, color, dash in [("EMA9", "#f39c12", None), ("EMA21", "#8e44ad", None), ("VWAP", "#2980b9", None),
                              ("VWAPu", "#2980b9", "dot"), ("VWAPl", "#2980b9", "dot"), ("ORH", "#27ae60", "dash"),
                              ("ORL", "#c0392b", "dash"), ("PDH", "#16a085", "dot"), ("PDL", "#d35400", "dot")]:
-        fig.add_trace(go.Scatter(x=x.index, y=x[col], name=col, line=dict(width=1, color=color, dash=dash)), 1, 1)
-    fig.add_trace(go.Scatter(x=x.index, y=x.ST.where(x.STdir == 1), name="ST up", line=dict(width=1.5, color="#27ae60")), 1, 1)
-    fig.add_trace(go.Scatter(x=x.index, y=x.ST.where(x.STdir == -1), name="ST down", line=dict(width=1.5, color="#c0392b")), 1, 1)
+        if on(next(k for k, cs in _OV_LINES.items() if col in cs)):
+            fig.add_trace(go.Scatter(x=x.index, y=x[col], name=col, line=dict(width=1, color=color, dash=dash)), 1, 1)
+    if on("Supertrend"):
+        fig.add_trace(go.Scatter(x=x.index, y=x.ST.where(x.STdir == 1), name="ST up", line=dict(width=1.5, color="#27ae60")), 1, 1)
+        fig.add_trace(go.Scatter(x=x.index, y=x.ST.where(x.STdir == -1), name="ST down", line=dict(width=1.5, color="#c0392b")), 1, 1)
     fresh = x.Signal.ne(0) & x.Signal.ne(x.Signal.shift())
     for s, sym_, col, ycol, off in [(1, "triangle-up", "#1e8449", "Low", -1), (-1, "triangle-down", "#b03a2e", "High", 1)]:
+        if not on("Signals"):
+            break
         m = x[fresh & (x.Signal == s)]
         fig.add_trace(go.Scatter(x=m.index, y=m[ycol] + off * 0.3 * m.ATR, mode="markers", name="CALL" if s > 0 else "PUT",
                                  marker=dict(symbol=sym_, size=12, color=col), text=m.Setups), 1, 1)
+    off_view = []
+    if levels and len(x):
+        lo, hi = float(x.Low.min()), float(x.High.max())
+        band = max(hi - lo, 0.01 * abs(float(x.Close.iloc[-1])))  # keep far levels from squashing the candles
+        for lv in levels:
+            lbl, y, color, dash = lv[:4]
+            try:
+                y = float(y)
+            except (TypeError, ValueError):
+                continue
+            if not np.isfinite(y):
+                continue
+            if not lo - band <= y <= hi + band:
+                off_view.append(f"{lbl} {y:,.2f}")
+                continue
+            note = lv[4] if len(lv) > 4 and lv[4] else ""
+            fig.add_hline(y=y, row=1, col=1, line_color=color, line_dash=dash, line_width=1, opacity=.9,
+                          annotation_text=f"{lbl} {y:,.2f}" + (f" · {note}" if note else ""),
+                          annotation_position="top right", annotation_font=dict(size=10, color=color))
+    op, cl, _ = SESSIONS[spec["sess"]]
+    rb = [dict(bounds=["sat", "mon"]), dict(bounds=[cl.hour + cl.minute / 60, op.hour + op.minute / 60], pattern="hour")]
+    if compact:
+        if has_vol:
+            fig.add_trace(go.Bar(x=x.index, y=x.Volume, name="Volume", showlegend=False,
+                                 marker_color=np.where(x.Close >= x.Open, "#26a69a", "#ef5350")), 2, 1)
+        fig.update_xaxes(rangebreaks=rb, gridcolor="#1e2d4a")
+        fig.update_yaxes(gridcolor="#1e2d4a", side="right")
+        fig.update_layout(height=560, template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                          xaxis_rangeslider_visible=False, margin=dict(l=6, r=6, t=26, b=6), font=dict(size=11),
+                          legend=dict(orientation="h", y=1.0, yanchor="bottom", x=0, font=dict(size=10)),
+                          meta=dict(off=off_view))
+        return fig
     r = 2
     if has_vol:
         fig.add_trace(go.Bar(x=x.index, y=x.Volume, name="Volume",
@@ -834,11 +1049,11 @@ def make_chart(d, name, spec, has_vol):
     fig.add_trace(go.Scatter(x=x.index, y=x.MACDsig, name="Signal", line=dict(width=1)), r + 2, 1)
     for col, color in [("ADX", "#2c3e50"), ("PDI", "#27ae60"), ("MDI", "#c0392b"), ("CHOP", "#95a5a6")]:
         fig.add_trace(go.Scatter(x=x.index, y=x[col], name=col, line=dict(width=1, color=color)), r + 3, 1)
-    op, cl, _ = SESSIONS[spec["sess"]]
-    fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"]),
-                                  dict(bounds=[cl.hour + cl.minute / 60, op.hour + op.minute / 60], pattern="hour")])
+    fig.update_xaxes(rangebreaks=rb)
     fig.update_layout(height=980, xaxis_rangeslider_visible=False, margin=dict(l=10, r=10, t=30, b=10),
                       legend=dict(orientation="h", y=1.02))
+    if off_view:
+        fig.update_layout(meta=dict(off=off_view))
     return fig
 
 
@@ -910,6 +1125,19 @@ def get_chain(spec, ltp, now):
 
 
 # ---------------- Analysis per symbol ----------------
+def benchmark(spec, interval, period):
+    """NIFTY 50 closes on the same timeframe for relative strength / market confirmation; None for NIFTY itself,
+    for commodities (different session and driver) or when the index can't be loaded."""
+    if spec["kind"] == "commodity" or spec["name"] == "NIFTY":
+        return None
+    try:
+        nspec = resolve("NIFTY")
+        raw, _ = get_prices(nspec, interval, period)
+        return prepare(raw, nspec, interval, None)[0].Close if len(raw) else None
+    except Exception:
+        return None
+
+
 def analyze(sym, P, vix, fx, now):
     spec = resolve(sym)
     period = "7d" if P["interval"] == "1m" else P["period"]  # Yahoo serves 1m candles for ~7 days only
@@ -920,7 +1148,7 @@ def analyze(sym, P, vix, fx, now):
     if len(df) < 60:
         return dict(spec=spec, error=f"only {len(df)} session bars; choose a longer history")
     has_vol = bool(df.Volume.sum() > 0)
-    d, votes = compute(df, spec, P, has_vol)
+    d, votes = compute(df, spec, P, has_vol, benchmark(spec, P["interval"], period))
     if d.empty:
         return dict(spec=spec, error="not enough bars after indicator warm-up")
     row = d.iloc[-1]
@@ -964,6 +1192,8 @@ def analyze(sym, P, vix, fx, now):
             notes.append(f"Setup fired but confluence {row.Score:+.1f} is short of ±{row.Need:.1f}")
         if row.TDir != 0 and row.HTF15 * row.TDir < 0:
             notes.append("15-min trend disagrees with the setup")
+        if row.get("CtxBlock"):
+            notes.append(f"Setup blocked by confirmation filter: {row.CtxBlock}")
         if row.Ext:
             notes.append(f"Price {abs(row.Close - row.EMA21) / row.ATR:.1f} ATR from EMA21: don't chase, wait for a pullback")
     if vix and vix > 22 and spec["kind"] != "commodity":
@@ -981,6 +1211,7 @@ def analyze(sym, P, vix, fx, now):
     tg = price_targets(row, ltp, iv, chain, spec, now)
     sa = side_analysis(spec, row, ltp, P, chain, iv, now, tg)
     bt_trades, bt = backtest(d, spec, P)
+    obt_trades, obt = option_backtest(d, spec, P)  # same signals scored on the option premium (model)
     if plan and (bt is None or bt["trades"] < 15 or bt["exp"] <= 0):
         notes.append("These rules have NO proven edge on this symbol's loaded history "
                      + (f"({bt['trades']} trades, {bt['exp']:+.2f} R each)" if bt else "(no trades)")
@@ -996,7 +1227,7 @@ def analyze(sym, P, vix, fx, now):
         conf = min(conf, 25)
     return dict(spec=spec, d=d, ltp=ltp, row=row, status=status, conf=conf, why=why, ctx=ctx, notes=notes, plan=plan,
                 chain=chain, news=news, ns=ns, iv=iv, iv_src=iv_src, has_vol=has_vol, bt=bt, bt_trades=bt_trades,
-                tg=tg, sa=sa, src=src, events=ev)
+                tg=tg, sa=sa, src=src, events=ev, obt=obt, obt_trades=obt_trades)
 
 
 @st.cache_data(ttl=90, show_spinner=False, max_entries=300)
@@ -1010,6 +1241,32 @@ def analyze_fast(sym, P, vix, fx, now):
     src_key = "upstox" if UPSTOX else "kite" if KITE is not None else "yahoo"
     minute = now.floor("min").isoformat()
     return _analyze_cached(sym, p_key, src_key, round(vix or 0, 2), round(fx or 0, 2), minute, P)
+
+
+def analyze_many(syms, P, vix, fx, now, fn=None, workers=8, progress=None):
+    """Analyse many symbols on a thread pool (the work is network-bound) -> {sym: analysis} in input order.
+    fn defaults to analyze_fast; progress(i, n, sym) is called on the calling thread as each symbol finishes."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import threading
+    fn = fn or analyze_fast
+    try:  # let worker threads use Streamlit caches without "missing ScriptRunContext" warnings
+        from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
+        ctx = get_script_run_ctx()
+        init = (lambda: add_script_run_ctx(threading.current_thread(), ctx)) if ctx else None
+    except Exception:
+        init = None
+    out = {}
+    with ThreadPoolExecutor(max_workers=max(1, min(workers, len(syms))), initializer=init) as pool:
+        futs = {pool.submit(fn, s, P, vix, fx, now): s for s in syms}
+        for i, fu in enumerate(as_completed(futs), 1):
+            s = futs[fu]
+            try:
+                out[s] = fu.result()
+            except Exception as e:
+                out[s] = dict(spec=resolve(s), error=f"{type(e).__name__}: {e}")
+            if progress:
+                progress(i, len(syms), s)
+    return {s: out[s] for s in syms}
 
 
 # ---------------- Momentum scanner & exit management ----------------
@@ -1136,11 +1393,11 @@ def option_price_signal(a, kind, K, price, held, paid, P, now):
     elif row.Signal == -dr:
         why_against.append(f"Engine signal is the opposite side: {a['status']}")
     if row.Score * dr >= row.Need:
-        why_for.append(f"Six-group score {row.Score:+.1f} supports {'upside' if dr > 0 else 'downside'}")
+        why_for.append(f"Confluence score {row.Score:+.1f} supports {'upside' if dr > 0 else 'downside'}")
     elif row.Score * dr <= -row.Need:
-        why_against.append(f"Six-group score {row.Score:+.1f} points the other way")
+        why_against.append(f"Confluence score {row.Score:+.1f} points the other way")
     else:
-        why_against.append(f"Six-group score {row.Score:+.1f} is not strong enough (±{row.Need:.1f})")
+        why_against.append(f"Confluence score {row.Score:+.1f} is not strong enough (±{row.Need:.1f})")
     why_against += ex["exit"]
     # Price quality
     if rich > 0.15:
@@ -1267,8 +1524,218 @@ def spread_chart(sa, a, qty):
     return fig
 
 
+# ---------------- Recommendation credibility ----------------
+def wilson_lo(k, n, z=1.645):
+    """One-sided 95% lower bound of a hit rate (Wilson score): what the record supports, not the lucky point estimate."""
+    if n <= 0:
+        return 0.0
+    p = k / n
+    return (p + z * z / (2 * n) - z * sqrt(p * (1 - p) / n + z * z / (4 * n * n))) / (1 + z * z / n)
+
+
+def _live_record(sym, kind):
+    try:
+        import paper  # lazy: paper imports engine
+        return paper.live_record(sym, kind)
+    except Exception:
+        return None
+
+
+CRED_W = {"pass": 1.0, "warn": 0.5, "fail": 0.0}
+
+
+def credibility(a, r, P):
+    """Evidence behind one BUY CALL / PUT plan -> grade A-D, score 0-100, evidence-based T1 hit estimate and the checks.
+    Each check: state 'pass' | 'warn' | 'fail' | 'n/a', weight, name, detail. Unknowns are left out of the score."""
+    spec, row, chain = a["spec"], a["row"], a["chain"]
+    now = pd.Timestamp.now(tz=IST)
+    kind, dr = r["kind"], 1 if r["kind"] == "CE" else -1
+    side = "CALL" if dr > 0 else "PUT"
+    C = []
+    add = lambda state, w, name, detail: C.append(dict(state=state, w=w, name=name, detail=detail))
+    # Model chance of reaching T1 before the close (x chance the trigger trades first, for conditional plans)
+    t, _ = session_left_years(spec, now)
+    p_reach = touch_prob(r["u_entry"], r["u_t1"], a["iv"], t) * ((r.get("prob") or 1.0) if r["mode"] == "trigger" else 1.0)
+    # 1. Back-test edge on this symbol: average R and its 95% floor
+    tr = a.get("bt_trades")
+    if tr is None or tr.empty:
+        add("fail", 3, "Back-test edge", "no past signals on the loaded history")
+    else:
+        n, R = len(tr), tr.R
+        lo = R.mean() - 1.645 * R.std(ddof=1) / sqrt(n) if n > 1 else -1.0
+        add("pass" if n >= 30 and lo > 0 else "warn" if R.mean() > 0 and n >= 15 else "fail", 3, "Back-test edge",
+            f"{n} trades, {R.mean():+.2f}R avg, 95% floor {lo:+.2f}R" + ("" if n >= 30 else " (small sample)"))
+    # 1b. The same signals scored on the option premium (Black-Scholes model, theta and costs included)
+    ob = a.get("obt")
+    if not ob:
+        add("n/a", 2, "Option back-test", "no past signals to price")
+    else:
+        n = ob["trades"]
+        add("pass" if n >= 20 and ob["floor"] > 0 else "warn" if ob["avg"] > 0 and n >= 10 else "fail", 2,
+            "Option back-test", f"{n} trades priced as options: {ob['avg'] * 100:+.1f}% of premium avg, "
+            f"{ob['win'] * 100:.0f}% winners, PF {ob['pf']:.2f} (model IV, 1.5% costs, expiry-day trades excluded)")
+    # 2. T1 hit rate for this side (and this setup when it has enough history)
+    hits = nt = 0
+    if tr is not None and not tr.empty:
+        m, scope = tr[tr.side == side], f"{side} signals"
+        labels = {s.strip() for s in (r.get("setup") or "").split(",") if s.strip()}
+        ms = m[m.setup.map(lambda s: bool(labels & {x.strip() for x in str(s).split(",")}))] if labels else m.iloc[:0]
+        if len(ms) >= 8:
+            m, scope = ms, "this setup"
+        hits, nt = int(m.t1_hit.sum()), len(m)
+    if nt < 5:
+        add("n/a", 2, "T1 hit record", f"only {nt} past {side} signals")
+    else:
+        lo = wilson_lo(hits, nt)
+        add("pass" if nt >= 10 and lo >= 0.45 else "warn" if hits / nt >= 0.5 else "fail", 2, "T1 hit record",
+            f"{hits}/{nt} {scope} reached T1 ({hits / nt * 100:.0f}%, at least {lo * 100:.0f}% with 95% confidence)")
+    # 3. Forward (live) track record: recommendations this app logged and later judged
+    lr = _live_record(r["sym"], kind)
+    if not lr or lr[1] < 5:
+        add("n/a", 2, "Live track record", f"{lr[1] if lr else 0} resolved {side} calls on {r['sym']} so far")
+    else:
+        k, n = lr
+        lo = wilson_lo(k, n)
+        add("pass" if lo >= 0.4 else "warn" if k / n >= 0.45 else "fail", 2, "Live track record",
+            f"{k}/{n} past {side} calls on {r['sym']} hit a target ({k / n * 100:.0f}%, floor {lo * 100:.0f}%)")
+    # 4. Liquidity of the recommended contract
+    q = (chain or {}).get("quotes", {}).get(r["strike"], {}).get(kind) if chain else None
+    if not q:
+        add("fail", 2, "Contract liquidity", "no live quote: premium is a model estimate, verify on your broker")
+    elif not (q["bid"] > 0 and q["ask"] >= q["bid"]):
+        add("warn", 2, "Contract liquidity", f"no two-sided book (LTP {q['ltp']:.2f}), fills may slip")
+    else:
+        sp = (q["ask"] - q["bid"]) / ((q["ask"] + q["bid"]) / 2) * 100
+        oi = q.get("oi") or 0
+        add("pass" if sp <= 3 and oi > 0 else "warn" if sp <= 8 else "fail", 2, "Contract liquidity",
+            f"bid-ask spread {sp:.1f}% of premium, OI {oi:,.0f}")
+    # 5. Can the underlying realistically reach T1 today?
+    add("pass" if p_reach >= 0.45 else "warn" if p_reach >= 0.25 else "fail", 2, "T1 reachable today",
+        f"{p_reach * 100:.0f}% model chance (IV {a['iv'] * 100:.0f}%) of touching {r['u_t1']:,.2f} before the close")
+    # 6. Premium reward : risk
+    risk = max(r["prem"] - r["sl"], 1e-9)
+    rr1, rr2 = (r["t1"] - r["prem"]) / risk, (r["t2"] - r["prem"]) / risk
+    add("pass" if rr2 >= 1.5 else "warn" if rr2 >= 1 else "fail", 1.5, "Premium reward:risk",
+        f"T1 {rr1:.1f}:1, T2 {rr2:.1f}:1 on the option itself")
+    # 7. Time decay versus the expected gain over the holding period
+    th = a["sa"]["sides"][kind]["theta"]
+    op, cl, _ = SESSIONS[spec["sess"]]
+    drag = max(th, 0) * min(P["hold"] * 60 / (tmin(cl) - tmin(op)), 1)
+    gain = max(r["t1"] - r["prem"], 1e-9)
+    add("pass" if drag <= 0.15 * gain else "warn" if drag <= 0.35 * gain else "fail", 1, "Theta drag",
+        f"≈₹{drag:.1f} decay over a {P['hold']:g}h hold vs ₹{gain:.1f} gain to T1 (θ {th:.1f}/day)")
+    # 8. Implied vs realized volatility: is the buyer overpaying for movement?
+    rv = realized_vol(a["d"], spec, P["interval"])
+    if a["iv_src"] in ("manual", "realized vol x1.2") or rv <= 0:
+        add("n/a", 1, "IV vs realized", "no market implied volatility to compare")
+    else:
+        x = a["iv"] / rv
+        add("pass" if x <= 1.25 else "warn" if x <= 1.6 else "fail", 1, "IV vs realized",
+            f"IV {a['iv'] * 100:.0f}% is {x:.2f}× realized {rv * 100:.0f}%" + (": premium is rich" if x > 1.25 else ""))
+    # 9a. Fresh corporate filing (NSE announcements): event-driven moves make technical levels less reliable
+    try:
+        import news  # lazy: news imports engine
+        cat = [x for x in news.catalysts(spec.get("nse") or r["sym"], now, 24) if x["alert"]]
+    except Exception:
+        cat = None
+    if cat is None:
+        add("n/a", 1, "News catalyst", "NSE announcements feed unavailable")
+    elif cat:
+        add("warn", 1, "News catalyst", f"{cat[0]['category']} filed {cat[0]['ts']:%d %b %H:%M}: "
+            f"{cat[0]['subject'][:70]} (event-driven moves can run through levels)")
+    else:
+        add("pass", 1, "News catalyst", "no market-moving NSE filing in the last 24 h")
+    # 9b. Market confirmation: NIFTY trend, relative strength and daily trend on the trade's side
+    agree, against = [], []
+    if pd.notna(row.get("MKT")) and row.MKT != 0:
+        (agree if row.MKT * dr > 0 else against).append("NIFTY trend")
+    if pd.notna(row.get("RS")):
+        (agree if row.RS * dr > 0 else against).append(f"RS vs NIFTY {row.RS:+.2f}%")
+    if pd.notna(row.get("D1")) and row.D1 != 0:
+        (agree if row.D1 * dr > 0 else against).append("daily trend")
+    if agree or against:
+        add("pass" if not against else "warn" if len(against) == 1 and agree else "fail", 1.5, "Market confirmation",
+            (("with: " + ", ".join(agree)) if agree else "") + ("; " if agree and against else "")
+            + (("against: " + ", ".join(against)) if against else ""))
+    else:
+        add("n/a", 1.5, "Market confirmation", "no NIFTY benchmark for this instrument")
+    # 9. Data freshness
+    age = (now - row.name).total_seconds() / 60 - int(P["interval"][:-1])
+    add("pass" if age <= 20 else "warn" if age <= 45 else "fail", 1.5, "Fresh data",
+        f"last candle {max(age, 0):.0f} min old · {a['src']}" + (f" + {chain['source']} chain" if chain else ", no chain"))
+    # 10. Scheduled events
+    ev = a.get("events", [])
+    if events.results_soon(ev):
+        add("fail", 2, "Event risk", "results due: IV crush and gaps make the plan unreliable")
+    else:
+        hi = [txt for sev, txt in ev if sev == "high"]
+        add("warn" if hi else "pass", 1, "Event risk", hi[0] if hi else "no high-impact event flagged")
+    known = [c for c in C if c["state"] != "n/a"]
+    score = 100 * sum(CRED_W[c["state"]] * c["w"] for c in known) / max(sum(c["w"] for c in known), 1e-9)
+    hard = {c["name"] for c in C if c["state"] == "fail"} & {"Back-test edge", "Contract liquidity", "Fresh data"}
+    if hard:
+        score = min(score, 64)  # unproven rules, an untradable contract or stale data cap the grade at C
+    if events.results_soon(ev):
+        score = min(score, 40)
+    score = int(round(score))
+    grade = "A" if score >= 80 else "B" if score >= 65 else "C" if score >= 50 else "D"
+    # Evidence-based T1 odds: back-test record shrunk toward the model probability (10 pseudo-trades of prior)
+    p_t1 = (hits + 10 * p_reach) / (nt + 10)
+    label = {"A": "Strong evidence", "B": "Fair evidence", "C": "Weak evidence", "D": "Poor evidence"}[grade]
+    return dict(grade=grade, score=score, label=label, p_t1=p_t1, checks=C,
+                fails=[c["name"] for c in C if c["state"] == "fail"])
+
+
 # ---------------- One-stock CALL / PUT recommendation ----------------
 def recommend(a, P):
+    """recommend_plan() plus a credibility grade; confidence is capped by the credibility score."""
+    r = recommend_plan(a, P)
+    if r["mode"] in ("now", "trigger"):
+        ce = r["kind"] == "CE"
+        risk_u = abs(r["u_entry"] - r["u_sl"])
+        r["rr"] = (abs(r["u_t1"] - r["u_entry"]) / risk_u, abs(r["u_t2"] - r["u_entry"]) / risk_u) if risk_u else None
+        r["invalid"] = (f"Invalid if a 15-min candle closes {'below' if ce else 'above'} {r['u_sl']:,.2f} "
+                        f"({'support' if ce else 'resistance'} lost)")
+        r["cred"] = credibility(a, r, P)
+        r["conf"] = min(r["conf"], r["cred"]["score"])
+    return r
+
+
+CRED_RANK = {"A": 0, "B": 1, "C": 2, "D": 3}
+
+
+def blocked_rec(a, P):
+    """The trade a setup would have produced when a confirmation filter blocked it (mode 'blocked'), so the live track
+    record can show whether the filters help. None when nothing was blocked on the last bar."""
+    row = a["row"]
+    if row.Signal != 0 or not row.get("CtxBlock") or not row.TDir:
+        return None
+    r2 = row.copy()
+    r2["Signal"] = int(np.sign(row.TDir))
+    p = option_plan(a["spec"], r2, a["ltp"], P, a["chain"], a["iv"], pd.Timestamp.now(tz=IST))
+    return dict(mode="blocked", kind=p["kind"], action=f"BLOCKED BUY {'CALL' if p['kind'] == 'CE' else 'PUT'}",
+                strike=p["strike"], prem=p["prem"], sl=p["p_sl"], t1=p["p_t1"], t2=p["p_t2"], u_entry=p["entry"],
+                u_sl=p["stop"], u_t1=p["t1"], u_t2=p["t2"], conf=0, score=row.Score, block=row.CtxBlock)
+
+
+def credible_ideas(results, P, min_grade="B", recs=None, near_n=5):
+    """BUY CALL / PUT plans from scan results that clear the credibility bar -> (passing, near misses), best first:
+    grade, then enter-now before trigger plans, then credibility score and evidence-based T1 odds.
+    recs: optional {sym: recommend()} already computed this run, to avoid recomputing."""
+    rows = []
+    for sym, a in (results or {}).items():
+        if not a or "error" in a:
+            continue
+        r = (recs or {}).get(sym) or recommend(a, P)
+        if r.get("mode") in ("now", "trigger") and r.get("cred"):
+            rows.append(dict(r, symbol=sym))
+    rows.sort(key=lambda r: (CRED_RANK[r["cred"]["grade"]], r["mode"] != "now", -r["cred"]["score"], -r["cred"]["p_t1"]))
+    bar = CRED_RANK.get(min_grade, 1)
+    ok = [r for r in rows if CRED_RANK[r["cred"]["grade"]] <= bar]
+    return ok, [r for r in rows if CRED_RANK[r["cred"]["grade"]] > bar][:near_n]
+
+
+def recommend_plan(a, P):
     """-> dict with action, mode ('now' | 'trigger' | 'none'), contract, premium & underlying entry/SL/T1/T2, trigger,
     confidence and reasons. Always gives a concrete plan, conditional when no setup has fired."""
     row, sa, tg, p, spec = a["row"], a["sa"], a["tg"], a["plan"], a["spec"]

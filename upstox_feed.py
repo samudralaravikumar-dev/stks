@@ -17,6 +17,7 @@ import io
 import json
 import os
 import secrets
+import threading
 import time
 import urllib.parse
 from datetime import date, datetime, timedelta
@@ -25,6 +26,8 @@ from pathlib import Path
 import pandas as pd
 import requests
 import streamlit as st
+
+import net
 
 IST = "Asia/Kolkata"
 API = "https://api.upstox.com"
@@ -37,6 +40,7 @@ MCX_MAP = {"CRUDE": "CRUDEOIL", "CRUDEOIL": "CRUDEOIL", "NATURALGAS": "NATURALGA
 UNITS = {"1m": 1, "5m": 5, "15m": 15}
 PERIOD_DAYS = {"5d": 7, "7d": 9, "1mo": 31, "30d": 31, "60d": 60}
 _last = [0.0]
+_rate_lock = threading.Lock()
 
 
 def credentials():
@@ -71,13 +75,14 @@ def login_url():
 
 
 def api(token, path, params=None):
-    """GET an Upstox endpoint -> 'data' payload. Raises on HTTP/API errors."""
-    wait = _last[0] + 0.12 - time.time()  # stay well under the per-second limits
-    if wait > 0:
-        time.sleep(wait)
-    _last[0] = time.time()
-    r = requests.get(API + path, params=params, timeout=12,
-                     headers={"Accept": "application/json", "Authorization": f"Bearer {token}"})
+    """GET an Upstox endpoint -> 'data' payload. Raises on HTTP/API errors. Thread-safe."""
+    with _rate_lock:  # space calls out across the scan threads to stay well under the per-second limits
+        wait = _last[0] + 0.12 - time.time()
+        if wait > 0:
+            time.sleep(wait)
+        _last[0] = time.time()
+    r = net.session("upstox").get(API + path, params=params, timeout=12,
+                                  headers={"Accept": "application/json", "Authorization": f"Bearer {token}"})
     j = r.json()
     if not r.ok or j.get("status") != "success":
         raise RuntimeError(f"Upstox {path}: {r.status_code} {str(j)[:200]}")
@@ -217,20 +222,29 @@ def _to_df(candles):
     return df.astype(float)
 
 
-@st.cache_data(ttl=60, show_spinner=False)
-def candles(token, key, interval, period):
-    """Past days (v3 historical, ≤1 month per call) + today's intraday candles, oldest first."""
-    unit = UNITS[interval]
+@st.cache_data(ttl=6 * 3600, show_spinner=False, max_entries=500)
+def _history(token, key, unit, days, day):
+    """Completed past-day candles (v3 historical, ≤1 month per call). They don't change during the day, so they
+    are fetched once per day instead of on every refresh."""
     k = urllib.parse.quote(key, safe="")
-    days = PERIOD_DAYS.get(period, 31)
-    end = date.today() - timedelta(days=1)
-    start = date.today() - timedelta(days=days)
+    today = date.fromisoformat(day)
+    end, start = today - timedelta(days=1), today - timedelta(days=days)
     parts = []
     while end >= start:
         frm = max(start, end - timedelta(days=28))
         d = api(token, f"/v3/historical-candle/{k}/minutes/{unit}/{end:%Y-%m-%d}/{frm:%Y-%m-%d}")
         parts.append(_to_df(d.get("candles", [])))
         end = frm - timedelta(days=1)
+    return pd.concat(parts) if parts else _to_df([])
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def candles(token, key, interval, period):
+    """Past days (cached for the day) + today's intraday candles (refetched each minute), oldest first."""
+    unit = UNITS[interval]
+    k = urllib.parse.quote(key, safe="")
+    day = pd.Timestamp.now(tz=IST).date().isoformat()  # IST trading day, also on UTC servers (Docker/Cloud)
+    parts = [_history(token, key, unit, PERIOD_DAYS.get(period, 31), day)]
     try:
         parts.append(_to_df(api(token, f"/v3/historical-candle/intraday/{k}/minutes/{unit}").get("candles", [])))
     except Exception:
@@ -257,12 +271,13 @@ def quotes(token, keys):
 
 
 @st.cache_data(ttl=60, show_spinner=False)
-def option_chain(token, chain_key, day):
-    """Nearest expiry chain -> dict(expiry 'DD-Mon-YYYY', lot, quotes {strike: {CE/PE: ltp, bid, ask, iv, oi, doi,
-    delta, theta}}, spot) or None."""
+def option_chain(token, chain_key, day, min_expiry=None):
+    """Nearest expiry chain (or the first expiry on/after min_expiry 'YYYY-MM-DD') -> dict(expiry 'DD-Mon-YYYY', lot, quotes {strike: {CE/PE: ltp, bid, ask, iv, oi, doi,
+    delta, theta, pop, gamma, vega, vol, cp (prev close), instrument_key}}, spot) or None."""
     try:
         contracts = api(token, "/v2/option/contract", {"instrument_key": chain_key})
-        exps = sorted({c["expiry"] for c in contracts if c.get("expiry") and c["expiry"] >= date.today().isoformat()})
+        floor = max(date.today().isoformat(), min_expiry or "")
+        exps = sorted({c["expiry"] for c in contracts if c.get("expiry") and c["expiry"] >= floor})
         if not exps:
             return None
         exp = exps[0]
@@ -280,7 +295,9 @@ def option_chain(token, chain_key, day):
                 quotes.setdefault(float(r["strike_price"]), {})[side] = dict(
                     ltp=md.get("ltp") or 0.0, bid=md.get("bid_price") or 0.0, ask=md.get("ask_price") or 0.0,
                     iv=gk.get("iv") or 0.0, oi=oi, doi=(oi - prev) if prev is not None else 0,
-                    delta=gk.get("delta"), theta=gk.get("theta"), pop=gk.get("pop"))
+                    delta=gk.get("delta"), theta=gk.get("theta"), pop=gk.get("pop"), gamma=gk.get("gamma"),
+                    vega=gk.get("vega"), vol=md.get("volume"), cp=md.get("close_price"),
+                    instrument_key=o.get("instrument_key"))
         if not quotes:
             return None
         return dict(expiry=datetime.strptime(exp, "%Y-%m-%d").strftime("%d-%b-%Y"), lot=lot, quotes=quotes, spot=spot)
