@@ -1556,6 +1556,32 @@ def wilson_lo(k, n, z=1.645):
     return (p + z * z / (2 * n) - z * sqrt(p * (1 - p) / n + z * z / (4 * n * n))) / (1 + z * z / n)
 
 
+def _live_stats(sym, kind):
+    try:
+        import paper  # lazy: paper imports engine
+        return paper.live_stats(sym, kind)
+    except Exception:
+        return None
+
+
+def proof(a, r):
+    """TRADE only when the call has a record behind it: its symbol's past signals made money on REAL option prices
+    (12+ trades) and the app's own recent live calls on that symbol/side are not losing. Otherwise PAPER.
+    -> dict(trade, why)."""
+    ls = _live_stats(r.get("sym") or a["spec"]["name"], r.get("kind"))
+    if ls and ls["last_n"] >= 5 and (ls["last_avg_r"] or 0) < 0:
+        return dict(trade=False, why=f"demoted: last {ls['last_n']} live calls averaged {ls['last_avg_r']:+.2f}R")
+    rb = a.get("rbt")
+    if not rb or rb["trades"] < 12:
+        n = rb["trades"] if rb else 0
+        return dict(trade=False, why=f"unproven: {n} past trades on real option prices (needs 12+)")
+    if rb["avg"] <= 0:
+        return dict(trade=False, why=f"past signals lost on real option prices ({rb['avg'] * 100:+.1f}% per trade, "
+                                     f"{rb['trades']} trades)")
+    live = (f" · live {ls['hits']}/{ls['n']} hit target" if ls and ls["n"] else "")
+    return dict(trade=True, why=f"real option prices: {rb['avg'] * 100:+.1f}% per trade over {rb['trades']} trades" + live)
+
+
 def _live_record(sym, kind):
     try:
         import paper  # lazy: paper imports engine
@@ -1747,15 +1773,22 @@ def execution(a, r, P):
     budget = P.get("capital", 0) * P.get("risk_pct", 1) / 100
     g = (r.get("cred") or {}).get("grade", "D")
     lots = int(budget * SIZE_BY_GRADE.get(g, 0) // risk_lot) if risk_lot > 0 else 0
-    rb = a.get("rbt")  # optional allowlist: only symbols whose signals made money on REAL option prices
-    real_ok = None if not rb or rb["trades"] < 12 else rb["avg"] > 0
-    if P.get("allowlist") and real_ok is False:
-        out.update(lot_size=lot, lots=0, risk_lot=risk_lot, cost_lot=(r.get("prem") or 0) * lot, allow_block=True,
-                   size_note=f"off: this symbol's signals lost on real option prices ({rb['avg'] * 100:+.1f}% per trade)")
+    pf = proof(a, r)
+    out["proof"] = pf
+    if P.get("proof_gate", True) and not pf["trade"]:  # no record behind it: track it, don't put money on it
+        out.update(lot_size=lot, lots=0, risk_lot=risk_lot, cost_lot=(r.get("prem") or 0) * lot,
+                   allow_block=bool(P.get("allowlist")), size_note=f"paper only: {pf['why']}")
         return out
+    if P.get("halt"):  # portfolio risk guard: daily loss, trades per day, losing streak, open positions
+        out.update(lot_size=lot, lots=0, risk_lot=risk_lot, cost_lot=(r.get("prem") or 0) * lot,
+                   size_note=f"no new trade: {P['halt']}")
+        return out
+    sf = P.get("size_factor", 1.0)
+    lots = int(budget * sf * SIZE_BY_GRADE.get(g, 0) // risk_lot) if risk_lot > 0 else 0
     out.update(lot_size=lot, lots=lots, risk_lot=risk_lot, cost_lot=(r.get("prem") or 0) * lot,
                size_note=(f"{lots} lot{'s' if lots != 1 else ''} × {lot} (grade {g}: "
-                          f"{int(SIZE_BY_GRADE.get(g, 0) * 100)}% of the ₹{budget:,.0f} risk budget)" if lots else
+                          f"{int(SIZE_BY_GRADE.get(g, 0) * 100)}% of the ₹{budget:,.0f} risk budget"
+                          + (", halved after a losing week)" if sf < 1 else ")") if lots else
                           f"paper only (grade {g})" if SIZE_BY_GRADE.get(g, 0) == 0 else
                           f"1 lot risks ₹{risk_lot:,.0f}, above the ₹{budget * SIZE_BY_GRADE.get(g, 0):,.0f} budget for grade {g}"))
     return out

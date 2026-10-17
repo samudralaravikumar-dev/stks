@@ -88,22 +88,56 @@ def unrealized(df):
                               (df.last_p - df.entry_p) * df.qty), index=df.index, dtype=float)
 
 
+RISK_DEFAULTS = dict(daily_loss_pct=2.0, max_open=3, max_trades_day=3, max_consec_loss=2, weekly_loss_pct=5.0)
+
+
 def risk_status(P, now):
-    """Portfolio limits before opening anything new. -> dict(ok, reasons, pnl_today, open, limit)."""
+    """Portfolio limits before opening anything new, from the app's trade journal: daily loss cap, max open positions,
+    max new trades per day, stop after N losses in a row today, and half size after a bad week.
+    -> dict(ok, reasons, pnl_today, open, limit, left, trades_today, streak, week_pnl, size_factor, open_index)."""
+    g = lambda k: P.get(k, RISK_DEFAULTS[k])
     df = trades_df()
     today = now.date().isoformat()
-    closed = df[(df.status == "CLOSED") & df.exit_at.fillna("").str.startswith(today)]
+    monday = (now - pd.Timedelta(days=now.weekday())).date().isoformat()
+    ex = df.exit_at.fillna("")
+    closed = df[(df.status == "CLOSED") & ex.str.startswith(today)]
+    week = df[(df.status == "CLOSED") & (ex.str[:10] >= monday)]
     opn = df[df.status == "OPEN"]
     unreal = float(unrealized(opn).sum())
     pnl = float(closed.pnl.sum()) + unreal
-    limit = P.get("capital", 0) * P.get("daily_loss_pct", 3.0) / 100
+    week_pnl = float(week.pnl.sum()) + unreal
+    cap = P.get("capital", 0)
+    limit = cap * g("daily_loss_pct") / 100
+    n_today = int(df.opened_at.fillna("").str.startswith(today).sum())
+    streak = 0
+    for v in closed.sort_values("exit_at", ascending=False).pnl:
+        if v >= 0:
+            break
+        streak += 1
     reasons = []
     if limit and pnl <= -limit:
         reasons.append(f"Daily loss limit hit: ₹{pnl:,.0f} vs limit -₹{limit:,.0f}. No new trades today.")
-    if len(opn) >= P.get("max_open", 4):
-        reasons.append(f"{len(opn)} open positions = max {P.get('max_open', 4)}. Close one before adding more.")
+    if len(opn) >= g("max_open"):
+        reasons.append(f"{len(opn)} open positions = max {g('max_open')}. Close one before adding more.")
+    if n_today >= g("max_trades_day"):
+        reasons.append(f"{n_today} trades today = max {g('max_trades_day')}. Done for the day.")
+    if streak >= g("max_consec_loss"):
+        reasons.append(f"{streak} losses in a row today: stop for the day (no revenge trades).")
+    wk = cap * g("weekly_loss_pct") / 100
+    size_factor = 0.5 if wk and week_pnl <= -wk else 1.0
     return dict(ok=not reasons, reasons=reasons, pnl_today=pnl, open=len(opn), limit=limit,
+                left=max(limit + min(pnl, 0), 0) if limit else None, trades_today=n_today, streak=streak,
+                week_pnl=week_pnl, week_limit=wk, size_factor=size_factor,
                 open_index=[(r.symbol, r.kind) for r in opn.itertuples() if r.symbol in INDEX_GROUP])
+
+
+def risk_controls(P, now):
+    """Settings the engine sizes with: size_factor (0.5 after a bad week) and halt (reason no new trade is allowed)."""
+    try:
+        rs = risk_status(P, now)
+    except Exception:
+        return dict(size_factor=1.0, halt=None)
+    return dict(size_factor=rs["size_factor"], halt=rs["reasons"][0] if rs["reasons"] else None)
 
 
 def paper_step(results, P, now):
@@ -305,6 +339,38 @@ def live_record(sym, kind, days=60):
     return int(k or 0), int(n or 0)
 
 
+def live_stats(sym, kind, days=60, last=5):
+    """Forward record of this app's own calls on one symbol/side. -> dict(n, hits, avg_r, last_n, last_avg_r)."""
+    c = conn()
+    since = (pd.Timestamp.now() - pd.Timedelta(days=days)).date().isoformat()
+    rows = c.execute("SELECT status, r_mult FROM recs WHERE symbol=? AND kind=? AND day>=? AND mode IN ('now','trigger') "
+                     "AND status IN ('T1 HIT','T2 HIT','STOP HIT','SQUARED OFF') ORDER BY ts DESC",
+                     (sym, kind, since)).fetchall()
+    c.close()
+    r = [float(x["r_mult"]) for x in rows if x["r_mult"] is not None]
+    tail = r[:last]
+    return dict(n=len(rows), hits=sum(x["status"] in ("T1 HIT", "T2 HIT") for x in rows),
+                avg_r=sum(r) / len(r) if r else None, last_n=len(tail), last_avg_r=sum(tail) / len(tail) if tail else None)
+
+
+def scorecard(days=28):
+    """Weekly scorecard of resolved calls: by week, side, symbol and grade-free source. -> dict of DataFrames."""
+    df = recs_df(days)
+    df = df[df["mode"].isin(["now", "trigger"]) & df.status.isin(["T1 HIT", "T2 HIT", "STOP HIT", "SQUARED OFF"])].copy()
+    if df.empty:
+        return {}
+    df["r_mult"] = pd.to_numeric(df.r_mult, errors="coerce")
+    df["win"] = df.r_mult > 0
+    df["week"] = pd.to_datetime(df.day).dt.to_period("W-SUN").dt.start_time.dt.date
+    agg = lambda g: g.agg(calls=("r_mult", "size"), win_pct=("win", "mean"), avg_r=("r_mult", "mean"),
+                          total_r=("r_mult", "sum")).reset_index()
+    out = {k: agg(df.groupby(k)) for k in ("week", "kind", "symbol")}
+    for v in out.values():
+        v["win_pct"] = v.win_pct * 100
+    out["symbol"] = out["symbol"].sort_values("total_r", ascending=False)
+    return out
+
+
 def add_broker_call(sym, side, entry, sl, t1, t2, source, now):
     """Track an external intraday call (broker desk, TV, newsletter) against live prices with the same judge as the app's
     own calls. ICICI-style: counted only if price trades within +/-0.25% of the entry ('not triggered' otherwise).
@@ -487,7 +553,8 @@ def push_signals(items, now, min_grade="C", send=True):
             continue
         ce = r["kind"] == "CE"
         rr = r.get("rr")
-        text = (f"{'🟢 BUY CALL' if ce else '🔴 BUY PUT'} {sym} {r['strike']:g} {r['kind']}"
+        text = (("" if not r.get("proof") or r["proof"]["trade"] else "📝 PAPER · ")
+                + f"{'🟢 BUY CALL' if ce else '🔴 BUY PUT'} {sym} {r['strike']:g} {r['kind']}"
                 + (f" ({r['expiry']})" if r.get("expiry") else "")
                 + f"\nEntry ₹{r['prem']:.2f} · SL ₹{r['sl']:.2f} · T1 ₹{r['t1']:.2f} · T2 ₹{r['t2']:.2f}"
                 + ("" if r.get("live") else " (model premium)")
@@ -496,6 +563,7 @@ def push_signals(items, now, min_grade="C", send=True):
                 + (f"\nLimit buy ≤ ₹{r['limit']:.2f} (spread {r.get('spread_pct', 0):.1f}%"
                    + (")" if r.get("spread_ok", True) else ", wide: skip or wait)") if r.get("limit") else "")
                 + (f"\nSize: {r['size_note']} · ₹{r.get('cost_lot', 0):,.0f} premium/lot" if r.get("size_note") else "")
+                + (f"\n{'✅ TRADE' if r['proof']['trade'] else '📝 PAPER ONLY'}: {r['proof']['why']}" if r.get("proof") else "")
                 + f"\nCredibility {c['grade']} ({c['score']}/100) · T1 odds {c['p_t1'] * 100:.0f}%"
                 + (f" · weak: {', '.join(c['fails'][:3])}" if c.get("fails") else "")
                 + (f"\n{r['invalid']}" if r.get("invalid") else "")

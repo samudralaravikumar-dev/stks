@@ -58,7 +58,7 @@ DEFAULT_WATCHLIST = "NIFTY, BANKNIFTY, FINNIFTY, RELIANCE, HDFCBANK, ICICIBANK, 
 
 
 def _conservative():
-    st.session_state.update(risk_pct=0.25, daily_loss_pct=0.75, max_open=2)
+    st.session_state.update(risk_pct=0.25, daily_loss_pct=0.75, max_open=2, max_trades_day=2, max_consec_loss=1)
 
 
 def wl_list():
@@ -398,10 +398,12 @@ with st.sidebar:
         target_delta = st.slider("Target |delta|", 0.35, 0.80, 0.55, 0.05)
         exit_mode = st.selectbox("Exit after T1", ["2R target + flip", "Run to close"])
         rr = st.slider("Final target (R multiple)", 1.5, 4.0, 2.0, 0.5)
-        allowlist = st.toggle("Only symbols profitable on real option prices", False,
-                              help="Hide alerts and size 0 for symbols whose past signals lost money on real Upstox "
-                                   "option prices (needs 12+ past trades). Off by default: on unseen dates such symbols "
-                                   "averaged +1.3% vs +2.5% for the profitable ones, a modest gap on few trades.")
+        proof_gate = st.toggle("Size only proven calls (TRADE / PAPER)", True, key="proof_gate",
+                               help="TRADE = the symbol's past signals made money on REAL Upstox option prices (12+ trades) "
+                                    "and its last 5 live calls are not losing. Everything else is PAPER: shown and "
+                                    "tracked with 0 lots until it earns a record.")
+        allowlist = st.toggle("Also hide PAPER calls from phone alerts", False,
+                              help="Off: PAPER calls still alert, marked 📝 PAPER, so you can watch them build a record.")
         t1_r = st.select_slider("Book half at (R multiple)", [0.5, 0.75, 1.0], E.T1_R,
                                 help="T1: book 50% and move the stop to breakeven. 0.5R raised the win rate from ~47% to "
                                      "~60% in an option-priced 120-day test with similar profit per trade; 1.0R wins less "
@@ -410,9 +412,13 @@ with st.sidebar:
         atr_mult = st.slider("Fallback stop (× ATR)", 0.75, 2.5, 1.5, 0.25)
         max_day = st.slider("Max trades per symbol per day", 1, 5, 2)
         st.markdown("**Portfolio risk guard**")
-        daily_loss_pct = st.slider("Daily loss limit (% of capital)", 0.5, 10.0, 3.0, 0.25, key="daily_loss_pct",
-                                   help="Paper trading stops opening trades for the day once hit")
-        max_open = st.slider("Max open positions", 1, 10, 4, key="max_open")
+        daily_loss_pct = st.slider("Daily loss limit (% of capital)", 0.5, 10.0, 2.0, 0.25, key="daily_loss_pct",
+                                   help="No new trades for the day once hit")
+        max_open = st.slider("Max open positions", 1, 10, 3, key="max_open")
+        max_trades_day = st.slider("Max new trades per day", 1, 10, 3, key="max_trades_day")
+        max_consec_loss = st.slider("Stop after losses in a row (today)", 1, 5, 2, key="max_consec_loss")
+        weekly_loss_pct = st.slider("Weekly loss that halves size (% of capital)", 1.0, 15.0, 5.0, 0.5,
+                                    key="weekly_loss_pct")
         corr_guard = st.checkbox("Treat NIFTY / BANKNIFTY / FINNIFTY same-side trades as one bet", True)
         max_loss = st.slider("Max premium loss before exit", 0.2, 0.6, 0.35, 0.05)
         hold = st.slider("Expected hold (hours)", 0.25, 5.0, 1.0, 0.25)
@@ -447,7 +453,9 @@ P = dict(interval=interval, period=period, th=th, adx_min=adx_min, lookback=look
          strike_mode=strike_mode, delta=target_delta, rr=rr, atr_mult=atr_mult, max_loss=max_loss, hold=hold,
          dte=dte, iv=iv_over, step=step_over, lot=lot_over, cost_pct=cost_pct, chain=use_chain, news=use_news,
          setups=set(setups_on), exit_mode=exit_mode, stop_min=stop_min, max_day=max_day, ctx_filter=tuple(ctx_filter), alert_grade=alert_grade, t1_r=t1_r, allowlist=allowlist,
-         daily_loss_pct=daily_loss_pct, max_open=max_open, corr_guard=corr_guard)
+         daily_loss_pct=daily_loss_pct, max_open=max_open, corr_guard=corr_guard, proof_gate=proof_gate,
+         max_trades_day=max_trades_day, max_consec_loss=max_consec_loss, weekly_loss_pct=weekly_loss_pct)
+P.update(paper.risk_controls(P, pd.Timestamp.now(tz=IST)))
 SYMBOLS = list(dict.fromkeys(s.strip().upper() for s in names.split(",") if s.strip()))
 
 COLORS = {"BUY CALL (CE)": "background-color:#1e8449;color:white", "BUY PUT (PE)": "background-color:#b03a2e;color:white",
@@ -642,6 +650,10 @@ def simple_view():
     st.html(ui_kit.APP_CSS)
     st.html(ui_kit.hero("Options", f"SRK signals · {now:%a %d %b, %H:%M} IST", px))
     st.html(ui_kit.sheet_title("Today's & this week's calls"))
+    try:
+        st.html(ui_kit.risk_meter(paper.risk_status(P, now), P))
+    except Exception:
+        pass
     c1, c2 = st.columns([3, 2])
     tab = c1.segmented_control("Calls", ["Active calls", "Exited calls"], default="Active calls", key="app_tab",
                                label_visibility="collapsed") or "Active calls"
@@ -649,7 +661,8 @@ def simple_view():
                                 label_visibility="collapsed") or "Options"
     if tab == "Active calls":
         live = sorted([(s, r, "Intraday: square off by 15:15") for s, r in recs.items() if r.get("mode") in ("now", "trigger")],
-                      key=lambda x: (E.CRED_RANK.get((x[1].get("cred") or {}).get("grade", "D"), 3), x[1]["mode"] != "now"))
+                      key=lambda x: (not (x[1].get("proof") or {}).get("trade"),
+                                     E.CRED_RANK.get((x[1].get("cred") or {}).get("grade", "D"), 3), x[1]["mode"] != "now"))
         try:
             live += _horizon_calls(ok)
         except Exception:
@@ -659,8 +672,9 @@ def simple_view():
         else:
             st.html('<div class="tk"><div class="empty2">No active CALL/PUT right now.<br>New calls appear here and '
                     'on your phone as alerts as soon as one forms.</div></div>')
-        st.caption("Expected profit / stop loss are for the suggested lots (grade-sized). Grade A/B = strong/fair evidence; "
-                   "C/D = weak/poor. BTST/2-day premium targets are estimated from the option's delta.")
+        st.caption("✅ TRADE = the symbol's signals made money on real option prices and its recent live calls are not "
+                   "losing. 📝 PAPER = no such record yet: watch it, 0 lots. Expected profit / stop loss are for the "
+                   "suggested lots. BTST/2-day premium targets are estimated from the option's delta.")
     else:
         ex = _exited_calls()
         if ex:
@@ -961,7 +975,7 @@ def users_tab():
                 + auth.users_secrets_snippet(), language="toml")
         st.caption("After anyone changes a password on Streamlit Cloud, copy this block again; otherwise the next restart "
                    "brings back the old password. Locally, users.db persists, so nothing is needed.")
-    st.dataframe(pd.DataFrame(auth.list_users()).drop(columns=["salt", "pw"]), hide_index=True, width="stretch")
+    st.dataframe(pd.DataFrame(auth.list_users()).drop(columns=["salt", "pw"], errors="ignore"), hide_index=True, width="stretch")
     c1, c2 = st.columns(2)
     with c1.form("add_user", clear_on_submit=True):
         st.markdown("**Add user**")
@@ -1811,6 +1825,21 @@ def track_tab():
         with st.spinner("Checking outcomes against live prices…"):
             paper.evaluate_recs(_bars_for, now)
         st.session_state["tr_eval"] = now
+    sc = paper.scorecard(28)
+    with st.expander("📋 Weekly scorecard · last 4 weeks of the app's own calls (in R: 1R = the planned risk)", expanded=bool(sc)):
+        if not sc:
+            st.caption("No resolved calls yet. Every CALL/PUT is judged automatically after the session; the scorecard "
+                       "fills in as they resolve.")
+        else:
+            cfg = dict(win_pct=st.column_config.NumberColumn("Win %", format="%.0f"),
+                       avg_r=st.column_config.NumberColumn("Avg R", format="%+.2f"),
+                       total_r=st.column_config.NumberColumn("Total R", format="%+.2f"))
+            w1, w2 = st.columns([3, 2])
+            w1.dataframe(sc["week"].sort_values("week", ascending=False), hide_index=True, width="stretch", column_config=cfg)
+            w2.dataframe(sc["kind"].replace({"CE": "CALL", "PE": "PUT"}), hide_index=True, width="stretch", column_config=cfg)
+            st.dataframe(sc["symbol"], hide_index=True, width="stretch", column_config=cfg)
+            st.caption("A symbol whose last 5 live calls average below 0R is automatically demoted to 📝 PAPER (0 lots) "
+                       "until it recovers.")
     days = {"Today": 0, "7 days": 7, "30 days": 30}[period or "7 days"]
     df = paper.recs_df(days=max(days, 1))
     if days == 0:

@@ -30,7 +30,7 @@ def default_settings():
              win_end=dtime(14, 45), orb_cut=E.tmin(dtime(13, 0)), capital=200000, risk_pct=1.0,
              strike_mode="Delta target", delta=0.55, rr=2.0, atr_mult=1.5, max_loss=0.35, hold=1.0, dte=3, iv=0.0,
              step=0.0, lot=0, cost_pct=0.03, chain=True, news=False, setups={"VWAPPB", "STFLIP", "SQZ", "ORB"},
-             exit_mode="2R target + flip", stop_min=0.75, max_day=2, daily_loss_pct=3.0, max_open=4, corr_guard=True,
+             exit_mode="2R target + flip", stop_min=0.75, max_day=2, **paper.RISK_DEFAULTS, corr_guard=True,
              ctx_filter=E.CTX_DEFAULT, alert_grade=os.environ.get("ALERT_GRADE") or "C", t1_r=E.T1_R)
     syms = [x.strip().upper() for x in (os.environ.get("WATCHLIST") or DEFAULT_SYMBOLS).split(",") if x.strip()]
     extra = []
@@ -72,8 +72,8 @@ def session_live(symbols, now):
 
 def one_pass(cfg):
     P, symbols = cfg["P"], cfg["symbols"]
-    P.setdefault("daily_loss_pct", 3.0)
-    P.setdefault("max_open", 4)
+    for k, v in paper.RISK_DEFAULTS.items():
+        P.setdefault(k, v)
     P.setdefault("corr_guard", True)
     now = pd.Timestamp.now(tz=E.IST)
     E.UPSTOX = uf.headless()
@@ -87,6 +87,7 @@ def one_pass(cfg):
     except Exception:
         traceback.print_exc()
     send = cfg.get("telegram", True)
+    P.update(paper.risk_controls(P, now))  # halt / half size from the journal's loss limits
     recs = [(s, E.recommend(a, P)) for s, a in {**wide, **results}.items() if "error" not in a]
     new = paper.push_signals(recs, now, P.get("alert_grade", "C"), send=send)  # CALL/PUT alerts to the phone
     new += paper.push_horizons(symbols, now, P.get("alert_grade", "C"), fx, send=send)  # BTST / 2-day before close

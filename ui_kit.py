@@ -1041,6 +1041,12 @@ APP_CSS = """<style>
   border-top:1px solid rgba(255,255,255,.08);font-size:13.5px;color:#d9cfe6}
 .tk .cc .row b{color:var(--txt);font-variant-numeric:tabular-nums;text-align:right}
 .tk .cc .ft{padding:8px 12px 11px;font-size:11.5px;color:var(--mut);border-top:1px solid rgba(255,255,255,.08)}
+.tk .cc .pf{font-size:10.5px;font-weight:800;letter-spacing:.04em;margin-left:6px;vertical-align:2px}
+.tk .rm{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin:0 0 12px}
+.tk .rm div{background:#1b1027;border:1px solid rgba(255,255,255,.08);border-radius:12px;padding:8px 6px;text-align:center}
+.tk .rm b{display:block;font-size:15px;color:var(--txt);font-variant-numeric:tabular-nums}
+.tk .rm span{font-size:9.5px;letter-spacing:.06em;text-transform:uppercase;color:var(--mut)}
+.tk .rmx{margin:-4px 2px 12px;font-size:12.5px;font-weight:700}
 .tk .empty2{padding:26px 10px;text-align:center;color:var(--mut);font-size:13.5px}
 </style>"""
 
@@ -1087,6 +1093,9 @@ def call_card(sym, r, view="Options", duration="Intraday"):
     live = r.get("mode") == "now"
     strip = "Enter now" if live else f"Enter only if {sym} goes {'above' if ce else 'below'} {_f(r.get('u_entry'))}"
     status = _badge("Active", _G) if live else _badge("Waiting", "#ffb400")
+    pf = r.get("proof")
+    chip = ("" if not pf else f' <span class="pf" style="color:{_G if pf["trade"] else "#ffb400"}">'
+            f'{"✅ TRADE" if pf["trade"] else "📝 PAPER"}</span>')
     lot = int(r.get("lot_size") or 1)
     lots = int(r.get("lots") or 0)
     qty = lot * max(lots, 1)
@@ -1110,7 +1119,8 @@ def call_card(sym, r, view="Options", duration="Intraday"):
              f'{c.get("p_t1", 0) * 100:.0f}%</b></div>')
     ft = []
     if view != "Futures":
-        ft.append(f'{lots} lot{"s" if lots != 1 else ""} × {lot}' if lots else f'1 lot × {lot} shown (size says skip)')
+        ft.append(f'{lots} lot{"s" if lots != 1 else ""} × {lot}' if lots else
+                  f'1 lot × {lot} shown · {r.get("size_note") or "size says skip"}')
         if r.get("limit"):
             ft.append(f'limit ≤ ₹{r["limit"]:,.2f}')
         if r.get("spread_pct") is not None:
@@ -1121,7 +1131,7 @@ def call_card(sym, r, view="Options", duration="Intraday"):
         ft.append(r["invalid"])
     return (f'<div class="cc {"ce" if ce else "pe"}"><div class="in"><div class="strip"><span>{escape(strip)}</span>'
             f'<span>{"⚡" if live else "⏳"}</span></div><div class="top">{_avatar(sym)}<div>'
-            f'<div class="nm">{escape(sym)}</div><div class="tg" style="color:{_G if ce else _R}">'
+            f'<div class="nm">{escape(sym)}{chip}</div><div class="tg" style="color:{_G if ce else _R}">'
             f'{"↗ BULLISH" if ce else "↘ BEARISH"}</div></div>{status}</div><div class="legs">{legs}</div>{rows}'
             + (f'<div class="ft">{escape(" · ".join(ft))}</div>' if ft else "") + '</div></div>')
 
@@ -1148,3 +1158,22 @@ def exited_card(row):
             f'<div class="legs"><div class="lg"><span>BUY {(row.get("strike") or 0):g} {escape(str(row.get("kind") or ""))}'
             f'</span><span><div class="k">Entry</div><b>₹{_f(row.get("prem") or 0)}</b></span></div></div>'
             f'<div class="row"><span>Result</span><b style="color:{col}">{res}</b></div></div></div>')
+
+
+def risk_meter(rs, P):
+    """Today's risk budget at a glance: trades used, P&L, loss budget left, losing streak; the stop reason if halted."""
+    cell = lambda lbl, v, col=None: (f'<div><b style="color:{col}">{v}</b><span>{lbl}</span></div>' if col else
+                                     f'<div><b>{v}</b><span>{lbl}</span></div>')
+    pnl = rs.get("pnl_today", 0)
+    left = rs.get("left")
+    html = ('<div class="tk"><div class="rm">'
+            + cell("Trades today", f'{rs.get("trades_today", 0)}/{P.get("max_trades_day", 3)}')
+            + cell("P&L today", f"₹{pnl:,.0f}", _G if pnl >= 0 else _R)
+            + cell("Loss budget left", f"₹{left:,.0f}" if left is not None else "–")
+            + cell("Loss streak", f'{rs.get("streak", 0)}/{P.get("max_consec_loss", 2)}')
+            + '</div>')
+    if not rs.get("ok", True):
+        html += f'<div class="rmx" style="color:{_R}">🛑 {escape(rs["reasons"][0])}</div>'
+    elif rs.get("size_factor", 1) < 1:
+        html += f'<div class="rmx" style="color:#ffb400">⚠ Losing week (₹{rs["week_pnl"]:,.0f}): sizes halved</div>'
+    return html + '</div>'
