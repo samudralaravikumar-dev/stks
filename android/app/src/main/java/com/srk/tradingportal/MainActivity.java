@@ -26,7 +26,7 @@ import androidx.swiperefreshlayout.widget.SwipeRefreshLayout;
 
 /**
  * Full-screen shell around the Streamlit portal. The analysis engine runs on the server; this app shows it
- * like a native app: remembered portal address, pull-to-refresh, offline screen, back navigation, external
+ * like a native app: remembered portal address, offline screen with Retry, back navigation, external
  * links in the browser. Long-press the offline screen's "Change address" to point it somewhere else.
  */
 public class MainActivity extends AppCompatActivity {
@@ -49,8 +49,9 @@ public class MainActivity extends AppCompatActivity {
         offline = findViewById(R.id.offline);
         setupWebView();
         swipe.setOnRefreshListener(() -> web.reload());
-        // Only refresh when the page itself is scrolled to the top (Streamlit scrolls inside the page)
-        swipe.setOnChildScrollUpCallback((parent, child) -> web.getScrollY() > 0);
+        // Pull-to-refresh is off: Streamlit scrolls inside its own container, so web.getScrollY() is always 0 and
+        // every downward drag reloaded the page (ending the session). The portal refreshes itself (sidebar Auto).
+        swipe.setEnabled(false);
         ((Button) findViewById(R.id.retry)).setOnClickListener(v -> loadPortal());
         ((Button) findViewById(R.id.change)).setOnClickListener(v -> askForUrl(true));
 
@@ -175,6 +176,12 @@ public class MainActivity extends AppCompatActivity {
         } else {
             super.onBackPressed();
         }
+    }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        CookieManager.getInstance().flush();  // persist the sign-in cookie now, not whenever WebView gets to it
     }
 
     @Override

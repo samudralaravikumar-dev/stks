@@ -1,0 +1,4 @@
+# Gradle wrapper: the shell script must keep LF endings to run on the Linux build machine
+android/gradlew text eol=lf
+*.bat text eol=crlf
+*.jar binary

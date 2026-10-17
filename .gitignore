@@ -10,6 +10,12 @@ android/.gradle/
 android/build/
 android/app/build/
 android/local.properties
+android/app/signing.p12
+android/app/signing-secrets.txt
+*.p12
+*.jks
+*.keystore
+push_android.bat
 .streamlit/secrets.toml
 .kite_session.json
 .upstox_session.json
