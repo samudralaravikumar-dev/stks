@@ -1865,6 +1865,18 @@ def track_tab():
             w1.dataframe(sc["week"].sort_values("week", ascending=False), hide_index=True, width="stretch", column_config=cfg)
             w2.dataframe(sc["kind"].replace({"CE": "CALL", "PE": "PUT"}), hide_index=True, width="stretch", column_config=cfg)
             st.dataframe(sc["symbol"], hide_index=True, width="stretch", column_config=cfg)
+            if sc.get("calibration") is not None:
+                c1, c2 = st.columns(2)
+                c1.markdown("**Are the T1 odds honest?** (stated vs actual)")
+                c1.dataframe(sc["calibration"], hide_index=True, width="stretch", column_config={
+                    "band": "T1 odds shown", "said": st.column_config.NumberColumn("Said %", format="%.0f"),
+                    "actual": st.column_config.NumberColumn("Actual %", format="%.0f")})
+                c2.markdown("**By credibility grade**")
+                c2.dataframe(sc["grade"], hide_index=True, width="stretch", column_config={
+                    "t1_hit_pct": st.column_config.NumberColumn("T1 hit %", format="%.0f"),
+                    "avg_r": st.column_config.NumberColumn("Avg R", format="%+.2f")})
+                st.caption("If 'Actual' stays well below 'Said', the odds shown on the cards are too optimistic. "
+                           "Calls logged before this was added have no stored odds and are left out.")
             st.caption("A symbol whose last 5 live calls average below 0R is automatically demoted to 📝 PAPER (0 lots) "
                        "until it recovers.")
     days = {"Today": 0, "7 days": 7, "30 days": 30}[period or "7 days"]

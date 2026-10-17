@@ -42,10 +42,25 @@ CREATE TABLE IF NOT EXISTS alerts(
 """
 
 
+_MIGRATED = set()
+NEW_COLS = [("recs", "grade", "TEXT"), ("recs", "p_t1", "REAL")]  # added after the first release: calibration
+
+
 def conn():
     """The journal database: the shared Postgres (Neon) when configured, else trading.db (see db.py)."""
     c = db.connect(DB, timeout=15)
     c.executescript(SCHEMA)
+    kind = "pg" if db.is_pg(c) else str(DB)
+    if kind not in _MIGRATED:  # older databases: add the newer columns once per process
+        for t, col, typ in NEW_COLS:
+            try:
+                if db.is_pg(c):
+                    c.execute(f"ALTER TABLE {t} ADD COLUMN IF NOT EXISTS {col} {'DOUBLE PRECISION' if typ == 'REAL' else typ}")
+                elif col not in [r[1] for r in c.execute(f"PRAGMA table_info({t})")]:
+                    c.execute(f"ALTER TABLE {t} ADD COLUMN {col} {typ}")
+            except Exception:
+                pass
+        _MIGRATED.add(kind)
     return c
 
 
@@ -322,10 +337,11 @@ def log_recs(items, now, source):
             continue
         n += c.execute(
             "INSERT OR IGNORE INTO recs(ts, day, symbol, kind, mode, action, strike, prem, sl_p, t1_p, t2_p, u_entry, u_sl, "
-            "u_t1, u_t2, conf, score, source, status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "u_t1, u_t2, conf, score, source, status, grade, p_t1) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (stamp, day, sym, r["kind"], r["mode"], r["action"], r["strike"], r["prem"], r["sl"], r["t1"], r["t2"],
              r["u_entry"], r["u_sl"], r["u_t1"], r["u_t2"], r.get("conf"), r.get("score"), source,
-             "WAITING" if r["mode"] == "trigger" else "OPEN")).rowcount
+             "WAITING" if r["mode"] == "trigger" else "OPEN", (r.get("cred") or {}).get("grade"),
+             (r.get("cred") or {}).get("p_t1"))).rowcount
     c.commit()
     c.close()
     return n
@@ -381,6 +397,21 @@ def scorecard(days=28):
     for v in out.values():
         v["win_pct"] = v.win_pct * 100
     out["symbol"] = out["symbol"].sort_values("total_r", ascending=False)
+    # calibration: do calls labelled "T1 odds 60%" really reach T1 about 60% of the time?
+    if "p_t1" in df.columns:
+        x = df.dropna(subset=["p_t1"]).copy()
+        if len(x):
+            x["p_t1"] = pd.to_numeric(x.p_t1, errors="coerce")
+            x["hit"] = x.status.isin(["T1 HIT", "T2 HIT"])
+            x["band"] = pd.cut(x.p_t1, [0, 0.4, 0.55, 0.7, 1.0], labels=["under 40%", "40-55%", "55-70%", "over 70%"])
+            cal = x.groupby("band", observed=True).agg(calls=("hit", "size"), said=("p_t1", "mean"),
+                                                       actual=("hit", "mean")).reset_index()
+            cal[["said", "actual"]] *= 100
+            out["calibration"] = cal
+            g = x.groupby("grade").agg(calls=("hit", "size"), t1_hit_pct=("hit", "mean"),
+                                       avg_r=("r_mult", "mean")).reset_index()
+            g["t1_hit_pct"] *= 100
+            out["grade"] = g
     return out
 
 
