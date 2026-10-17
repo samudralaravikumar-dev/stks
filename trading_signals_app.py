@@ -555,30 +555,86 @@ def _full_view():
     st.session_state["simple_view"] = False
 
 
+def _horizon_calls(ok):
+    """BTST / 2-day setups on the watchlist as card-ready dicts (premium targets estimated with the option's delta)."""
+    import horizons as H
+    fx = st.session_state.get("vix", (None, None, None))[2]
+    out = []
+    for s in wl_list():
+        try:
+            a = H.analyze(s, (fx or last_close("USDINR=X")[0]) if resolve(s)["kind"] == "commodity" else None)
+        except Exception:
+            continue
+        if a.get("error"):
+            continue
+        a2 = ok.get(s)
+        for kind, dur in (("BTST", "Overnight (BTST): exit next session"), ("SWING2D", "Up to 2 days"),
+                          ("SWINGPB", "Up to 2 days (pullback)")):
+            x = a["setups"][kind]
+            if not x["dir"]:
+                continue
+            g, why = H.grade(x["rec"])
+            k = "CE" if x["dir"] > 0 else "PE"
+            r = dict(kind=k, mode="now", u_entry=a["close"], u_t1=x["t1"], u_t2=x["t1"], u_sl=x["sl"],
+                     cred=dict(grade=g, p_t1=x["rec"]["hit"] if x["rec"]["n"] else 0), lots=1, lot_size=1,
+                     invalid=f"{kind} record: {why}")
+            if a2 and a2.get("sa"):
+                sd = a2["sa"]["sides"][k]
+                dl = abs(sd.get("delta") or 0.5)
+                r.update(strike=sd["strike"], prem=sd["prem"], live=sd["live"], expiry=(a2.get("chain") or {}).get("expiry"),
+                         t1=sd["prem"] + dl * abs(x["t1"] - a["close"]), sl=max(sd["prem"] - dl * abs(a["close"] - x["sl"]), 0.05),
+                         lot_size=int((a2.get("chain") or {}).get("lot") or a2["spec"].get("lot") or 1))
+                r["t2"] = r["t1"]
+            out.append((s, r, dur))
+    return out
+
+
+def _exited_calls(days=7):
+    df = paper.recs_df(days)
+    done = df[df.status.isin(["T1 HIT", "T2 HIT", "STOP HIT", "SQUARED OFF", "NOT TRIGGERED"])]
+    return done.sort_values("ts", ascending=False).to_dict("records")
+
+
 def simple_view():
-    """Phone-first single screen: market pulse, best calls, every live CALL/PUT, open paper positions, warnings."""
+    """Phone-first screen styled like a trading app: Active / Exited calls as cards, Options or Futures legs."""
     now = pd.Timestamp.now(tz=IST)
     res = st.session_state.get("last_results")
     if not res:
         res, _, _ = run_scan(now)
     ok = {s: a for s, a in res.items() if "error" not in a}
     recs = {s: recommend(a, P) for s, a in ok.items()}
-    strip = []
+    px = []
     for lbl, tk in (("NIFTY", "^NSEI"), ("BANKNIFTY", "^NSEBANK"), ("VIX", "^INDIAVIX")):
         v, chg = last_close(tk)
-        strip.append((lbl, f"{v:,.2f}" if v else "n/a", v * chg / (1 + chg) if v and chg is not None else None,
-                      chg * 100 if v and chg is not None else None))
-    st.html(ui_kit.kite_strip(strip))
-    st.html(ui_kit.MINI_CSS)
-    live = sorted([(s, r) for s, r in recs.items() if r.get("mode") in ("now", "trigger")],
-                  key=lambda x: (E.CRED_RANK.get((x[1].get("cred") or {}).get("grade", "D"), 3), x[1]["mode"] != "now"))
-    st.html(ui_kit.section(f"CALL / PUT signals · {len(live)} · best grade first"))
-    if live:
-        st.html('<div class="tk">' + "".join(ui_kit.mini_call(s, r) for s, r in live) + '</div>')
+        px.append((lbl, f"{v:,.2f}" if v else "n/a", chg * 100 if v and chg is not None else None))
+    st.html(ui_kit.APP_CSS)
+    st.html(ui_kit.hero("Options", f"SRK signals · {now:%a %d %b, %H:%M} IST", px))
+    st.html(ui_kit.sheet_title("Today's & this week's calls"))
+    c1, c2 = st.columns([3, 2])
+    tab = c1.segmented_control("Calls", ["Active calls", "Exited calls"], default="Active calls", key="app_tab",
+                               label_visibility="collapsed") or "Active calls"
+    view = c2.segmented_control("Instrument", ["Options", "Futures"], default="Options", key="app_view",
+                                label_visibility="collapsed") or "Options"
+    if tab == "Active calls":
+        live = sorted([(s, r, "Intraday: square off by 15:15") for s, r in recs.items() if r.get("mode") in ("now", "trigger")],
+                      key=lambda x: (E.CRED_RANK.get((x[1].get("cred") or {}).get("grade", "D"), 3), x[1]["mode"] != "now"))
+        try:
+            live += _horizon_calls(ok)
+        except Exception:
+            pass
+        if live:
+            st.html('<div class="tk">' + "".join(ui_kit.call_card(s, r, view, d) for s, r, d in live) + '</div>')
+        else:
+            st.html('<div class="tk"><div class="empty2">No active CALL/PUT right now.<br>New calls appear here and '
+                    'on your phone as alerts as soon as one forms.</div></div>')
+        st.caption("Expected profit / stop loss are for the suggested lots (grade-sized). Grade A/B = strong/fair evidence; "
+                   "C/D = weak/poor. BTST/2-day premium targets are estimated from the option's delta.")
     else:
-        st.caption("No CALL/PUT setups right now. They appear here (and on your phone as alerts) as soon as one forms.")
-    st.caption("Grade A/B = strong/fair evidence; C/D = weak/poor (no proven edge). Tap 'Open the full dashboard' for "
-               "the option chain, chart and the evidence behind each grade.")
+        ex = _exited_calls()
+        if ex:
+            st.html('<div class="tk">' + "".join(ui_kit.exited_card(r) for r in ex[:40]) + '</div>')
+        else:
+            st.html('<div class="tk"><div class="empty2">No calls closed in the last 7 days yet.</div></div>')
     tr = paper.trades_df()
     opn = tr[tr.status == "OPEN"]
     st.html(ui_kit.section(f"Open paper positions · {len(opn)}"))

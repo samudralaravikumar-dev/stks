@@ -1006,3 +1006,145 @@ def mini_call(sym, r):
                + '</div>' if r.get("spread_pct") is not None else "")
             + (f'<div class="n">📦 {escape(r["size_note"])} · ₹{r.get("cost_lot", 0):,.0f} premium per lot</div>'
                if r.get("size_note") else "") + '</div>')
+
+
+# ---------------- Phone "Calls" screen (app-style cards) ----------------
+APP_CSS = """<style>
+.tk .hero{border-radius:22px;padding:20px 18px 34px;margin:0 0 -22px;color:#fff;
+  background:linear-gradient(135deg,#3a1460 0%,#542087 38%,#7132b0 70%,#9b6bd6 100%)}
+.tk .hero h1{margin:0;font-size:26px;font-weight:800;color:#fff;line-height:1.15}
+.tk .hero p{margin:4px 0 12px;opacity:.85;font-size:13px}
+.tk .hero .px{display:flex;flex-wrap:wrap;gap:6px 16px;font-size:12.5px}
+.tk .hero .px b{font-variant-numeric:tabular-nums}
+.tk .hero .px .u{color:#7ff0c4} .tk .hero .px .d{color:#ffb3ab}
+.tk .sheet{background:var(--bg,#140b1d);border-radius:22px 22px 0 0;padding:16px 2px 2px;position:relative}
+.tk .sheet h2{font-size:19px;font-weight:800;margin:0 4px 12px;color:var(--txt)}
+.tk .cc{border-radius:16px;padding:1.5px;margin:0 0 14px;
+  background:linear-gradient(135deg,rgba(155,107,214,.9),rgba(49,192,144,.6))}
+.tk .cc.pe{background:linear-gradient(135deg,rgba(155,107,214,.9),rgba(231,95,83,.65))}
+.tk .cc.x{background:rgba(255,255,255,.10)}
+.tk .cc .in{background:#1b1027;border-radius:15px;overflow:hidden}
+.tk .cc .strip{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:8px 12px;font-size:12px;
+  background:rgba(255,255,255,.06);color:#d9cfe6}
+.tk .cc .top{display:flex;align-items:center;gap:10px;padding:12px 12px 4px}
+.tk .cc .av{width:40px;height:40px;border-radius:11px;display:grid;place-items:center;font-weight:800;font-size:13px;
+  color:#fff;flex:none}
+.tk .cc .nm{font-weight:800;font-size:16px;color:var(--txt);line-height:1.2}
+.tk .cc .tg{font-size:11px;font-weight:700;letter-spacing:.05em}
+.tk .cc .st{margin-left:auto;font-size:12px;font-weight:800;padding:4px 11px;border-radius:999px;white-space:nowrap}
+.tk .cc .legs{padding:2px 12px 4px}
+.tk .cc .lg{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:6px 0;font-size:13.5px;
+  color:var(--txt)}
+.tk .cc .lg .k{font-size:10.5px;color:var(--mut);text-align:right}
+.tk .cc .lg b{font-variant-numeric:tabular-nums;font-size:15px}
+.tk .cc .row{display:flex;justify-content:space-between;gap:10px;padding:10px 12px;
+  border-top:1px solid rgba(255,255,255,.08);font-size:13.5px;color:#d9cfe6}
+.tk .cc .row b{color:var(--txt);font-variant-numeric:tabular-nums;text-align:right}
+.tk .cc .ft{padding:8px 12px 11px;font-size:11.5px;color:var(--mut);border-top:1px solid rgba(255,255,255,.08)}
+.tk .empty2{padding:26px 10px;text-align:center;color:var(--mut);font-size:13.5px}
+</style>"""
+
+_AV = ["#542087", "#148564", "#c63224", "#7132b0", "#0f6b50", "#b8860b", "#2f5aa8", "#8a5cc7"]
+_G = "#31c090"
+_R = "#e75f53"
+
+
+def _avatar(sym):
+    col = _AV[sum(map(ord, str(sym))) % len(_AV)]
+    return f'<div class="av" style="background:{col}">{escape(str(sym)[:2])}</div>'
+
+
+def _badge(text, col):
+    return f'<span class="st" style="background:{col}22;color:{col}">{escape(text)}</span>'
+
+
+def _contract(r):
+    """'28 OCT 2450 CE' from the chain expiry '28-Oct-2025'."""
+    e = str(r.get("expiry") or "")
+    tag = " ".join(e.split("-")[:2]).upper() if e.count("-") == 2 else ""
+    return f'{tag + " " if tag else ""}{(r.get("strike") or 0):g} {r.get("kind") or ""}'
+
+
+def hero(title, subtitle, prices):
+    """Gradient header. prices: [(name, value text, change % or None)]."""
+    px = "".join(f'<span>{escape(n)} <b>{escape(v)}</b>'
+                 + (f' <span class="{"u" if c >= 0 else "d"}">{"▲" if c >= 0 else "▼"}{abs(c):.2f}%</span>'
+                    if c is not None else "") + '</span>' for n, v, c in prices)
+    return (f'<div class="tk"><div class="hero"><h1>{escape(title)}</h1><p>{escape(subtitle)}</p>'
+            f'<div class="px">{px}</div></div></div>')
+
+
+def sheet_title(text):
+    return f'<div class="tk"><div class="sheet"><h2>{escape(text)}</h2></div></div>'
+
+
+def call_card(sym, r, view="Options", duration="Intraday"):
+    """App-style card for one live CALL/PUT: status, legs, expected profit and stop loss in rupees for the suggested lots."""
+    ce = r.get("kind") == "CE"
+    c = r.get("cred") or {}
+    g = c.get("grade", "–")
+    gc = {"A": UP, "B": ACC, "C": WARN, "D": DN}.get(g, "#64748b")
+    live = r.get("mode") == "now"
+    strip = "Enter now" if live else f"Enter only if {sym} goes {'above' if ce else 'below'} {_f(r.get('u_entry'))}"
+    status = _badge("Active", _G) if live else _badge("Waiting", "#ffb400")
+    lot = int(r.get("lot_size") or 1)
+    lots = int(r.get("lots") or 0)
+    qty = lot * max(lots, 1)
+    if view == "Futures":
+        legs = (f'<div class="lg"><span><span style="color:{_G if ce else _R}">●</span> {"BUY" if ce else "SELL"} '
+                f'{escape(sym)} FUT</span><span><div class="k">Entry</div><b>{_f(r.get("u_entry"))}</b></span></div>')
+        pts = lambda x: abs((x or 0) - (r.get("u_entry") or 0))
+        rows = (f'<div class="row"><span>Target 1 / Target 2</span><b style="color:{_G}">{_f(r.get("u_t1"))} / '
+                f'{_f(r.get("u_t2"))}</b></div><div class="row"><span>Stop loss</span><b style="color:{_R}">'
+                f'{_f(r.get("u_sl"))} <small>({pts(r.get("u_sl")):,.1f} pts)</small></b></div>')
+    else:
+        legs = (f'<div class="lg"><span><span style="color:{_G}">●</span> BUY {escape(_contract(r))}</span>'
+                f'<span><div class="k">Entry</div><b>₹{_f(r.get("prem") or 0)}</b></span></div>')
+        prem = r.get("prem") or 0
+        rows = (f'<div class="row"><span>Expected profit (T2)</span><b style="color:{_G}">'
+                f'₹{((r.get("t2") or 0) - prem) * qty:,.0f}</b></div>'
+                f'<div class="row"><span>Stop loss</span><b style="color:{_R}">₹{(prem - (r.get("sl") or 0)) * qty:,.0f}</b></div>'
+                f'<div class="row"><span>Targets (premium)</span><b>₹{_f(r.get("t1") or 0)} / ₹{_f(r.get("t2") or 0)}</b></div>')
+    rows += (f'<div class="row"><span>Duration</span><b>{escape(duration)}</b></div>'
+             f'<div class="row"><span>Grade · T1 odds</span><b><span style="color:{gc}">{g}</span> · '
+             f'{c.get("p_t1", 0) * 100:.0f}%</b></div>')
+    ft = []
+    if view != "Futures":
+        ft.append(f'{lots} lot{"s" if lots != 1 else ""} × {lot}' if lots else f'1 lot × {lot} shown (size says skip)')
+        if r.get("limit"):
+            ft.append(f'limit ≤ ₹{r["limit"]:,.2f}')
+        if r.get("spread_pct") is not None:
+            ft.append(f'bid-ask {r["spread_pct"]:.1f}%' + ("" if r.get("spread_ok", True) else " ⚠ wide"))
+        if not r.get("live"):
+            ft.append("model premium")
+    if r.get("invalid"):
+        ft.append(r["invalid"])
+    return (f'<div class="cc {"ce" if ce else "pe"}"><div class="in"><div class="strip"><span>{escape(strip)}</span>'
+            f'<span>{"⚡" if live else "⏳"}</span></div><div class="top">{_avatar(sym)}<div>'
+            f'<div class="nm">{escape(sym)}</div><div class="tg" style="color:{_G if ce else _R}">'
+            f'{"↗ BULLISH" if ce else "↘ BEARISH"}</div></div>{status}</div><div class="legs">{legs}</div>{rows}'
+            + (f'<div class="ft">{escape(" · ".join(ft))}</div>' if ft else "") + '</div></div>')
+
+
+def exited_card(row):
+    """Card for a resolved recommendation from the track record (recs table row as a dict)."""
+    ce = row.get("kind") == "CE"
+    st_ = str(row.get("status") or "")
+    rm = row.get("r_mult")
+    rm = None if rm is None or rm != rm else float(rm)
+    win = rm is not None and rm > 0
+    if st_ in ("EXPIRED", "NOT TRIGGERED"):
+        badge, col = _badge("Not triggered", "#94a3b8"), "#94a3b8"
+    else:
+        badge, col = (_badge("Profit", _G), _G) if win else (_badge("Loss" if rm else "Flat", _R if rm else "#94a3b8"),
+                                                            _R if rm else "#94a3b8")
+    res = escape(str(row.get("outcome") or st_ or "–")) + (f' ({rm:+.2f}R)' if rm is not None else "")
+    when = escape(str(row.get("day") or ""))
+    src = str(row.get("mode") or "")
+    src = f' · {escape(src.split(":", 1)[1])}' if src.startswith("broker:") else ""
+    return (f'<div class="cc x"><div class="in"><div class="top">{_avatar(row.get("symbol", ""))}<div>'
+            f'<div class="nm">{escape(str(row.get("symbol", "")))}</div><div class="tg" style="color:{_G if ce else _R}">'
+            f'{"↗ BULLISH" if ce else "↘ BEARISH"} · {when}{src}</div></div>{badge}</div>'
+            f'<div class="legs"><div class="lg"><span>BUY {(row.get("strike") or 0):g} {escape(str(row.get("kind") or ""))}'
+            f'</span><span><div class="k">Entry</div><b>₹{_f(row.get("prem") or 0)}</b></span></div></div>'
+            f'<div class="row"><span>Result</span><b style="color:{col}">{res}</b></div></div></div>')

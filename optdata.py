@@ -106,11 +106,15 @@ except Exception:
     pass
 
 
-def real_option_backtest(d, spec, P, token, cost=0.015, max_trades=None, roll="default"):
+def real_option_backtest(d, spec, P, token, cost=0.015, max_trades=None, roll="default", spread=None,
+                         time_stop=None):
     """The engine's signals with the same entries/exits as backtest() (next-bar entry, underlying stop / T1 half /
     T2, breakeven after T1, square-off), priced on the REAL option: the delta-0.55 strike of the nearest expiry on or
     after the trade day, entry at that contract's 15-min open, exits at the contract's prices on the exit bar
-    (stop: bar low; target / T1 / square-off: bar close; conservative). -> (trades DataFrame, stats dict or None)."""
+    (stop: bar low; target / T1 / square-off: bar close; conservative). -> (trades DataFrame, stats dict or None).
+    spread='t2': a debit spread instead - also SELL the same-expiry option nearest the underlying's T2 level (max profit
+    at the target); stops value it at long low / short high, other exits at both closes; costs on both legs.
+    time_stop=N: exit at the bar close N bars after entry when T1 has not been reached (stops theta bleed)."""
     key = chain_key(spec)
     if not key:
         return pd.DataFrame(), None
@@ -156,34 +160,56 @@ def real_option_backtest(d, spec, P, token, cost=0.015, max_trades=None, roll="d
         if p0 <= 0.5:
             i += 1
             continue
-        per_day[days[i]] = per_day.get(days[i], 0) + 1
         sl_u, t1_u, t2_u = S0 - dr * R, S0 + dr * t1r * R, S0 + dr * t2d[i]
-        half, booked, exit_p, why, j = False, 0.0, None, "", j0
+        obs, Ks, q0 = None, None, 0.0
+        if spread:  # short leg: same expiry, strike nearest the underlying's T2, beyond the long strike
+            beyond = [k for k in strikes if (k - K) * dr > 0]
+            Ks = min(beyond, key=lambda k: abs(k - t2_u)) if beyond else None
+            obs = candles(token, chains[exp][(Ks, kind)], day, exp < today) if Ks is not None else None
+            if obs is None or obs.empty or idx[j0] not in obs.index:
+                i += 1
+                continue
+            q0 = float(obs.loc[idx[j0], "Open"])
+            if p0 - q0 <= 0.5:
+                i += 1
+                continue
+        net0 = p0 - q0
+        per_day[days[i]] = per_day.get(days[i], 0) + 1
+        half, booked, exit_v, why, j = False, 0.0, None, "", j0
+
+        def val(bar, bar2, worst=False):  # position value: long leg minus short leg
+            if obs is None:
+                return float(bar.Low) if worst else float(bar.Close)
+            return (float(bar.Low) - float(bar2.High)) if worst else (float(bar.Close) - float(bar2.Close))
         while j < n and days[j] == day:
             bar = ob.loc[idx[j]] if idx[j] in ob.index else None
-            if bar is None:
+            bar2 = obs.loc[idx[j]] if obs is not None and idx[j] in obs.index else None
+            if bar is None or (obs is not None and bar2 is None):
                 j += 1
                 continue
             adv, fav = (l[j], h[j]) if dr > 0 else (h[j], l[j])
             stop_lvl = S0 if half else sl_u
             if (adv - stop_lvl) * dr <= 0:
-                exit_p, why = float(bar.Low), "breakeven" if half else "stop"
+                exit_v, why = val(bar, bar2, worst=True), "breakeven" if half else "stop"
             else:
                 if not half and (fav - t1_u) * dr >= 0:
-                    half, booked = True, 0.5 * (float(bar.Close) - p0)
+                    half, booked = True, 0.5 * (val(bar, bar2) - net0)
                 if (fav - t2_u) * dr >= 0:
-                    exit_p, why = float(bar.Close), "target"
+                    exit_v, why = val(bar, bar2), "target"
+                elif time_stop and not half and j - j0 >= time_stop:
+                    exit_v, why = val(bar, bar2), "time stop"
                 elif mins[j] >= sqm or j + 1 >= n or days[j + 1] != days[j]:
-                    exit_p, why = float(bar.Close), "square-off"
-            if exit_p is not None:
+                    exit_v, why = val(bar, bar2), "square-off"
+            if exit_v is not None:
                 break
             j += 1
-        if exit_p is None:
+        if exit_v is None:
             i = j + 1
             continue
-        pnl = (booked + (0.5 if half else 1.0) * (exit_p - p0)) / p0 - cost
+        pnl = (booked + (0.5 if half else 1.0) * (exit_v - net0)) / net0 - cost * (p0 + q0) / net0
         out.append(dict(entry_time=idx[j0], side="CALL" if dr > 0 else "PUT", expiry=exp, strike=K, prem=round(p0, 2),
-                        dte=(exp - day).days, exit_reason=why, t1_hit=half, pnl_pct=round(pnl * 100, 2)))
+                        short_strike=Ks, net_debit=round(net0, 2), dte=(exp - day).days, exit_reason=why,
+                        t1_hit=half, pnl_pct=round(pnl * 100, 2)))
         i = j + 1
     t = pd.DataFrame(out)
     if t.empty:
