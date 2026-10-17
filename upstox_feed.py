@@ -101,15 +101,38 @@ def _exchange_code(code):
     return j
 
 
+BROWSER_COOKIE = "srk_upstox"  # analytics token pasted in the app, kept in that browser only
+
+
+def _looks_like_token(t):
+    return isinstance(t, str) and t.count(".") == 2 and 100 < len(t) < 2000
+
+
 def analytics_token():
-    """Long-lived read-only market-data token ([upstox] analytics_token or env UPSTOX_ANALYTICS_TOKEN)."""
+    """Long-lived read-only market-data token: env UPSTOX_ANALYTICS_TOKEN, [upstox] analytics_token in secrets, or
+    one the user pasted into the app (this session / this browser's cookie)."""
     tok = os.environ.get("UPSTOX_ANALYTICS_TOKEN")
     if not tok:
         try:
             tok = st.secrets["upstox"].get("analytics_token")
         except Exception:
             tok = None
-    return tok or None
+    if not tok:
+        try:
+            tok = st.session_state.get("upstox_token") or st.context.cookies.get(BROWSER_COOKIE)
+        except Exception:
+            tok = None
+    return tok if _looks_like_token(tok) else None
+
+
+def remember_token_in_browser(token):
+    """Keep a pasted analytics token in this browser (1-year cookie) so the app uses it on every visit. An empty
+    token clears it. The value is checked to be a JWT-shaped token before it reaches the script."""
+    value = token if _looks_like_token(token) else ""
+    value = "".join(ch for ch in value if ch.isalnum() or ch in "-_.")
+    st.iframe(f"<script>try{{const w=window.parent;w.document.cookie='{BROWSER_COOKIE}={value}; "
+              f"Max-Age={31536000 if value else 0}; Path=/; SameSite=Lax'+(w.location.protocol==='https:'?"
+              f"'; Secure':'');}}catch(e){{}}</script>", height=1)
 
 
 def token_expiry(token):

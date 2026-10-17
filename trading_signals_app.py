@@ -281,6 +281,8 @@ with st.sidebar:
         source = st.radio("Market data", sources, index=0 if (up_key or returning) else 2)
         if source.startswith("Upstox"):
             _tok, up_status, up_url = upstox_feed.session()
+            if st.session_state.pop("upstox_token_save", None):
+                upstox_feed.remember_token_in_browser(st.session_state.get("upstox_token"))
             if _tok:
                 E.UPSTOX = _tok
                 st.success(f"🟢 Upstox: {up_status}")
@@ -290,6 +292,18 @@ with st.sidebar:
                     st.rerun()
             else:
                 st.warning(f"Upstox: {up_status}. Using Yahoo + NSE meanwhile.")
+                if not upstox_feed.analytics_token():  # no token on this server (e.g. Streamlit Cloud without secrets)
+                    with st.form("upstox_token_form", clear_on_submit=True):
+                        pasted = st.text_input("Paste your Upstox analytics token", type="password",
+                                               help="From the Upstox developer console (Analytics token). Saved only "
+                                                    "in this browser for a year, not on the server or in GitHub.")
+                        if st.form_submit_button("Use this token", type="primary", use_container_width=True):
+                            pasted = (pasted or "").strip()
+                            if upstox_feed._looks_like_token(pasted) and upstox_feed._check(pasted):
+                                st.session_state["upstox_token"] = pasted
+                                st.session_state["upstox_token_save"] = pasted
+                                st.rerun()
+                            st.error("Upstox rejected that token, or it isn't an analytics token. Copy it again.")
                 if up_url:
                     st.link_button("🔑 Log in to Upstox", up_url, type="primary")
                     st.caption("You return here after login; the session is saved until ~03:30 tomorrow.")
