@@ -378,7 +378,8 @@ with st.sidebar:
         st.caption("📲 Alerts go to: " + (", ".join(ch) if ch else "nowhere yet: add [ntfy] topic or [telegram] to secrets"))
     st.markdown("**🔄 Refresh**")
     c1, c2 = st.columns(2)
-    auto = c1.toggle("Auto", False, help="Keep on during market hours so signals and paper trades update")
+    auto = c1.toggle("Auto", True, help="On by default: signals, prices and paper trades refresh by themselves "
+                                        "(every minute unless you pick a longer interval)")
     every = c2.selectbox("Every", [60, 120, 300], index=0, format_func=lambda s: f"{s // 60} min",
                          label_visibility="collapsed")
 
@@ -761,6 +762,19 @@ def analysis_tab():
 
 def users_tab():
     st.markdown("Manage who can log in. Passwords are stored as salted PBKDF2-SHA256 hashes in `users.db`.")
+    with st.expander("☁ Keep accounts and sign-ins across Streamlit Cloud restarts"):
+        st.markdown("Streamlit Cloud wipes `users.db` whenever the app restarts (after sleeping, on every redeploy). "
+                    "Paste this into the app's **Settings → Secrets** (keep your existing `[upstox]` / `[ntfy]` lines). "
+                    "Accounts are then restored automatically and everyone stays signed in until they log out or change "
+                    "their password. It contains salted password **hashes**, never passwords; keep it private.")
+        try:
+            sec = st.secrets["auth"]["secret"]
+        except Exception:
+            sec = None
+        st.code("[auth]\nsecret = \"" + (sec or "paste-a-long-random-secret-here") + "\"\n\n"
+                + auth.users_secrets_snippet(), language="toml")
+        st.caption("After anyone changes a password on Streamlit Cloud, copy this block again; otherwise the next restart "
+                   "brings back the old password. Locally, users.db persists, so nothing is needed.")
     st.dataframe(pd.DataFrame(auth.list_users()).drop(columns=["salt", "pw"]), hide_index=True, width="stretch")
     c1, c2 = st.columns(2)
     with c1.form("add_user", clear_on_submit=True):

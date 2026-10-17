@@ -6,6 +6,7 @@ Mobile + SMS OTP login: 6-digit codes, 5-minute expiry, hashed at rest, 5 tries 
 Providers ([sms] in .streamlit/secrets.toml): twilio (Twilio Verify), msg91, fast2sms, or console (testing:
 the code is printed in the server window).
 """
+import base64
 import hashlib
 import hmac
 import os
@@ -104,9 +105,94 @@ def set_mobile(username, mobile):
     return None
 
 
-# ---------------- Remember-me sessions (stay signed in until Log out) ----------------
+# ---------------- Remember-me sign-in (until Log out or a password change) ----------------
+# The cookie holds a signed token: username + a fingerprint of the current password hash, HMAC-signed with the app's
+# secret. It needs no server-side session row, so it survives Streamlit Cloud restarts (which wipe users.db when the
+# accounts are restored from secrets), and it stops working by itself when the password changes.
 COOKIE = "srk_session"
-SESSION_DAYS = 30
+SESSION_DAYS = 3650  # cookie lifetime: effectively permanent
+
+
+def _secret():
+    """Signing key: [auth] secret in secrets.toml (set it on Streamlit Cloud so sign-ins survive restarts), env
+    AUTH_SECRET, else a random key kept in DATA_DIR/.auth_secret."""
+    try:
+        k = st.secrets["auth"]["secret"]
+        if k:
+            return str(k).encode()
+    except Exception:
+        pass
+    if os.environ.get("AUTH_SECRET"):
+        return os.environ["AUTH_SECRET"].encode()
+    f = DATA_DIR / ".auth_secret"
+    try:
+        return f.read_text().strip().encode()
+    except OSError:
+        k = secrets.token_hex(32)
+        f.write_text(k)
+        return k.encode()
+
+
+def _fp(salt, pw):
+    return hashlib.sha256(f"{salt}:{pw}".encode()).hexdigest()[:16]
+
+
+def make_token(username):
+    """Signed, stateless sign-in token tied to this user's current password."""
+    with _conn() as c:
+        r = c.execute("SELECT salt, pw FROM users WHERE username=?", (username.lower(),)).fetchone()
+    payload = base64.urlsafe_b64encode(f"{username.lower()}:{_fp(r['salt'], r['pw'])}".encode()).decode().rstrip("=")
+    sig = hmac.new(_secret(), payload.encode(), hashlib.sha256).hexdigest()[:40]
+    return f"{payload}.{sig}"
+
+
+def _token_user(token):
+    """-> user dict when the signature is valid, the token is not revoked and the password is unchanged, else None."""
+    try:
+        payload, sig = token.split(".")
+        if not hmac.compare_digest(sig, hmac.new(_secret(), payload.encode(), hashlib.sha256).hexdigest()[:40]):
+            return None
+        username, fp = base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)).decode().split(":")
+    except Exception:
+        return None
+    with _conn() as c:
+        if c.execute("SELECT 1 FROM sessions WHERE token_hash=? AND username='__revoked__'", (_th(token),)).fetchone():
+            return None
+        r = c.execute("SELECT username, name, role, salt, pw FROM users WHERE username=?", (username,)).fetchone()
+    if r is None or not hmac.compare_digest(fp, _fp(r["salt"], r["pw"])):
+        return None
+    return dict(username=r["username"], name=r["name"], role=r["role"])
+
+
+def seed_users_from_secrets():
+    """Recreate accounts listed under [[auth.users]] in secrets.toml when they are missing (Streamlit Cloud wipes
+    users.db on every restart). Existing accounts are left alone. -> number added."""
+    try:
+        rows = st.secrets["auth"]["users"]
+    except Exception:
+        return 0
+    n = 0
+    with _conn() as c:
+        for u in rows:
+            try:
+                n += c.execute("INSERT OR IGNORE INTO users(username, name, role, salt, pw, created, mobile) "
+                               "VALUES(?,?,?,?,?,?,?)",
+                               (str(u["username"]).lower(), u.get("name") or u["username"], u.get("role", "user"),
+                                u["salt"], u["pw"], datetime.now().isoformat(timespec="seconds"),
+                                u.get("mobile") or None)).rowcount
+            except (KeyError, sqlite3.IntegrityError):
+                continue
+    return n
+
+
+def users_secrets_snippet():
+    """TOML [[auth.users]] blocks for every account (salted PBKDF2 hashes, never passwords): paste into Streamlit
+    Cloud's Secrets so accounts survive restarts."""
+    with _conn() as c:
+        rows = c.execute("SELECT username, name, role, salt, pw, mobile FROM users ORDER BY username").fetchall()
+    q = lambda v: '"' + str(v or "").replace("\\", "\\\\").replace('"', '\\"') + '"'
+    return "\n".join(f"[[auth.users]]\nusername = {q(r['username'])}\nname = {q(r['name'])}\nrole = {q(r['role'])}\n"
+                     f"salt = {q(r['salt'])}\npw = {q(r['pw'])}\nmobile = {q(r['mobile'])}\n" for r in rows)
 
 
 def _th(token):
@@ -129,6 +215,8 @@ def session_user(token):
     """-> user dict for a valid, unexpired token (sliding expiry), else None."""
     if not isinstance(token, str) or not token or len(token) > 200:
         return None
+    if "." in token:  # signed token (current format); older random tokens fall through to the sessions table
+        return _token_user(token)
     now = datetime.now()
     with _conn() as c:
         r = c.execute("SELECT s.username, s.expires, u.name, u.role FROM sessions s JOIN users u ON u.username=s.username "
@@ -145,6 +233,9 @@ def revoke_session(token):
     if isinstance(token, str) and token:
         with _conn() as c:
             c.execute("DELETE FROM sessions WHERE token_hash=?", (_th(token),))
+            if "." in token:  # signed token: mark it revoked (this device logged out)
+                c.execute("INSERT OR REPLACE INTO sessions(token_hash, username, created, expires, last_seen) "
+                          "VALUES(?, '__revoked__', ?, '9999-12-31', NULL)", (_th(token), datetime.now().isoformat()))
 
 
 def revoke_all_sessions(username):
@@ -156,7 +247,7 @@ def _cookie_js(value, max_age):
     """Set/clear the session cookie from a tiny same-origin iframe (Streamlit can read cookies but not set them),
     mirrored in localStorage so a browser that drops the cookie can restore it (see _restore_js).
     The value is our own urlsafe token (or empty), never user input."""
-    value = "".join(ch for ch in value if ch.isalnum() or ch in "-_")
+    value = "".join(ch for ch in value if ch.isalnum() or ch in "-_.")
     st.iframe(
         f"<script>try{{const w=window.parent;w.document.cookie='{COOKIE}={value}; Max-Age={int(max_age)}; "
         f"Path=/; SameSite=Lax'+(w.location.protocol==='https:'?'; Secure':'');"
@@ -185,7 +276,7 @@ def _no_pull_refresh():
 
 def _remember(user):
     """Log the user in for this browser: session state now, cookie on the next render."""
-    tok = create_session(user["username"])
+    tok = make_token(user["username"])
     st.session_state["user"] = user
     st.session_state["session_token"] = tok
     st.session_state["cookie_pending"] = tok
@@ -404,10 +495,16 @@ def set_role(username, role):
 
 
 # ---------------- Streamlit gate ----------------
+@st.cache_resource(show_spinner=False)
+def _seed_once():
+    return seed_users_from_secrets()
+
+
 def gate():
     """Render login / first-run setup until authenticated. -> user dict (stops the script otherwise).
     A remember-me cookie keeps the user signed in across reloads, reconnects and app restarts until Log out."""
     _no_pull_refresh()
+    _seed_once()
     if st.session_state.get("cookie_clear"):
         _cookie_js("", 0)
         st.session_state.pop("cookie_clear", None)
@@ -491,8 +588,8 @@ def gate():
                             _remember(u)
                             st.rerun()
                         st.error(err)
-            st.caption(f"You stay signed in on this device for {SESSION_DAYS} days (renewed each visit) until you press "
-                       "Log out. Ask your admin for an account. Educational tool, not financial advice.")
+            st.caption("You stay signed in on this device until you press Log out or change your password. "
+                       "Ask your admin for an account. Educational tool, not financial advice.")
     st.stop()
 
 
