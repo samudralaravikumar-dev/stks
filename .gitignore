@@ -24,3 +24,5 @@ users.db
 engine_settings.json
 
 streamlit_cloud_secrets.toml
+optcache/
+.auth_secret
