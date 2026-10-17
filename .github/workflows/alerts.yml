@@ -1,0 +1,68 @@
+# Always-on alerts: runs the background engine every 5 minutes on weekdays during NSE + MCX hours, so CALL/PUT,
+# BTST/2-day and news alerts reach your phone even when no one has the portal open (Streamlit Cloud sleeps and
+# cannot run runner.py). The engine skips closed markets and exchange holidays by itself.
+#
+# One-time setup (GitHub -> Settings -> Secrets and variables -> Actions):
+#   Secrets:   UPSTOX_ANALYTICS_TOKEN   (same token as in secrets.toml)      NTFY_TOPIC   (your ntfy topic)
+#              optional: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+#   Variables: optional WATCHLIST (e.g. "NIFTY, BANKNIFTY, RELIANCE, CRUDE"), optional ALERT_GRADE (A/B/C/D)
+#
+# State (alert de-duplication, paper journal, track record, option-chain snapshots) is kept between runs in the
+# Actions cache. GitHub may start scheduled runs a few minutes late and pauses schedules after 60 days without
+# repository activity (re-enable under Actions).
+name: Market alerts
+
+on:
+  schedule:
+    - cron: "*/5 3-17 * * 1-5"  # 08:30-23:25 IST, Monday-Friday
+  workflow_dispatch:
+
+concurrency:
+  group: market-alerts
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      TZ: Asia/Kolkata
+      TRAD_DATA_DIR: ${{ github.workspace }}/state
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        run: pip install -q -r requirements.txt
+
+      - name: Restore engine state
+        uses: actions/cache/restore@v5
+        with:
+          path: state
+          key: srk-state-${{ github.run_id }}
+          restore-keys: srk-state-
+
+      - name: Scan and alert
+        env:
+          UPSTOX_ANALYTICS_TOKEN: ${{ secrets.UPSTOX_ANALYTICS_TOKEN }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          WATCHLIST: ${{ vars.WATCHLIST }}
+          ALERT_GRADE: ${{ vars.ALERT_GRADE }}
+        run: |
+          mkdir -p state
+          if [ -z "$UPSTOX_ANALYTICS_TOKEN" ]; then echo "::warning::UPSTOX_ANALYTICS_TOKEN secret not set: using delayed Yahoo + NSE data"; fi
+          if [ -z "$NTFY_TOPIC" ] && [ -z "$TELEGRAM_BOT_TOKEN" ]; then echo "::warning::No NTFY_TOPIC / TELEGRAM secrets: alerts are logged but not pushed"; fi
+          python runner.py --once --cloud
+
+      - name: Save engine state
+        if: always()
+        uses: actions/cache/save@v5
+        with:
+          path: state
+          key: srk-state-${{ github.run_id }}

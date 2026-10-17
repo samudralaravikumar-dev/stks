@@ -962,3 +962,38 @@ def sector_tiles(rows, title=None):
         return '<div class="kt"><div class="sec-h">Sector data unavailable</div></div>'
     return (f'<div class="kt">' + (f'<div class="sec-h">{escape(str(title))}</div>' if title else "")
             + f'<div class="sec">{"".join(out)}</div></div>')
+
+
+# ---------------- Simple (mobile) view ----------------
+MINI_CSS = """<style>
+.tk .mini{background:var(--card);border:1px solid var(--line);border-left:4px solid var(--acc);border-radius:12px;
+  padding:10px 12px;margin:0 0 8px}
+.tk .mini.ce{border-left-color:var(--up)} .tk .mini.pe{border-left-color:var(--dn)}
+.tk .mini .t{display:flex;justify-content:space-between;align-items:center;gap:8px;font-weight:800;color:var(--txt)}
+.tk .mini .t small{font-weight:600;color:var(--mut)}
+.tk .mini .g{display:inline-grid;place-items:center;min-width:24px;height:24px;border-radius:7px;border:1px solid;
+  font-size:12px;font-weight:800}
+.tk .mini .r{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-top:8px}
+.tk .mini .r div{background:rgba(255,255,255,.04);border-radius:8px;padding:5px 6px;text-align:center}
+.tk .mini .r b{display:block;font-size:14px;color:var(--txt);font-variant-numeric:tabular-nums}
+.tk .mini .r span{font-size:9.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--mut)}
+.tk .mini .n{font-size:11.5px;color:var(--mut);margin-top:6px}
+</style>"""
+
+
+def mini_call(sym, r):
+    """One compact CALL/PUT card for the phone: action, contract, entry/SL/T1/T2 premiums, grade and trigger."""
+    ce = r.get("kind") == "CE"
+    c = r.get("cred") or {}
+    g = c.get("grade", "–")
+    gc = {"A": UP, "B": ACC, "C": WARN, "D": DN}.get(g, "#64748b")
+    when = "enter now" if r.get("mode") == "now" else f"only {'above' if ce else 'below'} {_f(r.get('u_entry'))}"
+    cell = lambda lbl, v: f'<div><span>{lbl}</span><b>{_f(v)}</b></div>'
+    rr = r.get("rr")
+    return (f'<div class="mini {"ce" if ce else "pe"}"><div class="t"><span>{"▲ BUY CALL" if ce else "▼ BUY PUT"} · '
+            f'{escape(sym)} {r.get("strike", 0):g} {escape(str(r.get("kind", "")))}</span>'
+            f'<span class="g" style="color:{gc};border-color:{gc}">{g}</span></div>'
+            f'<div class="r">{cell("Entry", r.get("prem"))}{cell("Stop", r.get("sl"))}{cell("T1", r.get("t1"))}'
+            f'{cell("T2", r.get("t2"))}</div>'
+            f'<div class="n">{escape(when)} · T1 odds {c.get("p_t1", 0) * 100:.0f}%'
+            + (f' · R:R 1:{rr[1]:.1f}' if rr else "") + (" · model premium" if not r.get("live") else "") + '</div></div>')

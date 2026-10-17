@@ -4,6 +4,7 @@ Run:  run.bat   (or: .venv\\Scripts\\python -m streamlit run trading_signals_app
 Analysis lives in engine.py; paper trading & alerts in paper.py; background runner in runner.py.
 Educational tool only. NOT financial advice.
 """
+import re
 from datetime import time as dtime
 
 import numpy as np
@@ -252,6 +253,11 @@ st.markdown(ui_kit.CSS, unsafe_allow_html=True)
 with st.sidebar:
     st.markdown(f"### 👤 {user['name']}")
     st.selectbox("🎨 Colour scheme", list(theme.SCHEMES), format_func=theme.SCHEMES.get, key="color_scheme")
+    if "simple_view" not in st.session_state:
+        ua = str(st.context.headers.get("User-Agent", "")) if hasattr(st, "context") else ""
+        st.session_state["simple_view"] = bool(re.search(r"Android|iPhone|iPad|Mobile", ua))
+    st.toggle("📱 Simple view", key="simple_view",
+              help="One screen for the phone: best calls, live signals, positions and warnings. On by default on phones.")
     st.caption(f"@{user['username']} · {user['role']}")
     cu1, cu2 = st.columns(2)
     with cu1.popover("🔑 Password", use_container_width=True):
@@ -540,6 +546,63 @@ def _chg(a):
 
 def _spark(a, n=26):
     return [float(x) for x in a["d"].Close.tail(n)] + [float(a["ltp"])]
+
+
+def _full_view():
+    st.session_state["simple_view"] = False
+
+
+def simple_view():
+    """Phone-first single screen: market pulse, best calls, every live CALL/PUT, open paper positions, warnings."""
+    now = pd.Timestamp.now(tz=IST)
+    res = st.session_state.get("last_results")
+    if not res:
+        res, _, _ = run_scan(now)
+    ok = {s: a for s, a in res.items() if "error" not in a}
+    recs = {s: recommend(a, P) for s, a in ok.items()}
+    strip = []
+    for lbl, tk in (("NIFTY", "^NSEI"), ("BANKNIFTY", "^NSEBANK"), ("VIX", "^INDIAVIX")):
+        v, chg = last_close(tk)
+        strip.append((lbl, f"{v:,.2f}" if v else "n/a", v * chg / (1 + chg) if v and chg is not None else None,
+                      chg * 100 if v and chg is not None else None))
+    st.html(ui_kit.kite_strip(strip))
+    st.html(ui_kit.MINI_CSS)
+    live = sorted([(s, r) for s, r in recs.items() if r.get("mode") in ("now", "trigger")],
+                  key=lambda x: (E.CRED_RANK.get((x[1].get("cred") or {}).get("grade", "D"), 3), x[1]["mode"] != "now"))
+    st.html(ui_kit.section(f"CALL / PUT signals · {len(live)} · best grade first"))
+    if live:
+        st.html('<div class="tk">' + "".join(ui_kit.mini_call(s, r) for s, r in live) + '</div>')
+    else:
+        st.caption("No CALL/PUT setups right now. They appear here (and on your phone as alerts) as soon as one forms.")
+    st.caption("Grade A/B = strong/fair evidence; C/D = weak/poor (no proven edge). Tap 'Open the full dashboard' for "
+               "the option chain, chart and the evidence behind each grade.")
+    tr = paper.trades_df()
+    opn = tr[tr.status == "OPEN"]
+    st.html(ui_kit.section(f"Open paper positions · {len(opn)}"))
+    if len(opn):
+        pnl = paper.unrealized(opn) if hasattr(paper, "unrealized") else (opn.last_p - opn.entry_p) * opn.qty
+        st.dataframe(pd.DataFrame({"Position": opn.symbol + " " + opn.strike.map(lambda x: f"{x:g}") + " " + opn.kind,
+                                   "Avg": opn.entry_p, "LTP": opn.last_p, "P&L ₹": pnl, "SL": opn.sl_p, "T1": opn.t1_p}),
+                     hide_index=True, width="stretch",
+                     column_config={c: st.column_config.NumberColumn(format="%.2f") for c in ("Avg", "LTP", "P&L ₹", "SL", "T1")})
+    else:
+        st.caption("No open paper positions.")
+    warn = [f"📅 {s}: {t}" for s, a in ok.items() for sev, t in a.get("events", []) if sev == "high"]
+    try:
+        import news
+        an = news.announcements()
+        if len(an):
+            x = an[an.alert & an.symbol.isin(ok) & (an.ts >= now - pd.Timedelta(hours=12))]
+            warn += [f"📰 {r.symbol}: {r.category} · {r.subject[:70]}" for r in x.itertuples()]
+    except Exception:
+        pass
+    if warn:
+        st.html(ui_kit.section("Warnings"))
+        for w in warn[:8]:
+            st.caption(w)
+    st.button("🖥 Open the full dashboard", on_click=_full_view, use_container_width=True)
+    st.caption(f"Updated {now:%H:%M} IST" + (f" · refreshes every {every // 60} min" if auto else "")
+               + " · educational signals, not advice.")
 
 
 def credible_panel(results, key, recs=None):
@@ -2659,6 +2722,9 @@ def notifications_panel(now, unread=None):
 TABS = ["🏠 Home", "📊 Signals board", "⭐ Watchlist", "📈 NIFTY 50", "✅ Track record", "⚡ Stock → CALL/PUT", "🌙 BTST & 2-day", "📅 Results", "🔎 Analysis", "🧠 Options analytics", "🌐 Market intel",
         "💰 CE/PE price check", "🧮 Spread builder", "📒 Paper trading & alerts", "🚀 Momentum scanner",
         "🎯 Position manager", "📖 Method"] + (["👥 Users"] if user["role"] == "admin" else [])
+if st.session_state.get("simple_view"):  # phones: one compact screen instead of 20+ tabs
+    st.fragment(simple_view, run_every=every if auto else None)()
+    st.stop()
 tabs = st.tabs(TABS)
 with tabs[TABS.index("🏠 Home")]:
     st.fragment(home_tab, run_every=every if auto else None)()

@@ -3,7 +3,9 @@ Background engine: scans the saved symbols on every candle, paper-trades each si
 with or without the browser open. Uses the settings saved from the app's "Paper trading & alerts" tab.
 
 Run:  run_engine.bat      (Ctrl+C to stop)      One pass only:  python runner.py --once
+Scheduled cloud pass (GitHub Actions, .github/workflows/alerts.yml):  python runner.py --once --cloud
 """
+import os
 import sys
 import time
 import traceback
@@ -12,9 +14,33 @@ from datetime import time as dtime
 import pandas as pd
 
 import engine as E
+import events
 import kite_feed as kf
 import paper
 import upstox_feed as uf
+
+
+DEFAULT_SYMBOLS = "NIFTY, BANKNIFTY, FINNIFTY, RELIANCE, HDFCBANK, ICICIBANK, SBIN, INFY, TCS, LT, CRUDE, NATURALGAS"
+
+
+def default_settings():
+    """The app's default sidebar settings, for cloud runs with no saved engine_settings.json (GitHub Actions).
+    Symbols come from env WATCHLIST (comma separated, e.g. a GitHub repository variable) or the default watchlist."""
+    P = dict(interval="15m", period="60d", th=6.0, adx_min=20, lookback=3, use_time=True, win_start=dtime(9, 30),
+             win_end=dtime(11, 0), orb_cut=E.tmin(dtime(13, 0)), capital=200000, risk_pct=1.0,
+             strike_mode="Delta target", delta=0.55, rr=2.0, atr_mult=1.5, max_loss=0.35, hold=1.0, dte=3, iv=0.0,
+             step=0.0, lot=0, cost_pct=0.03, chain=True, news=False, setups={"VWAPPB", "STFLIP", "SQZ", "ORB"},
+             exit_mode="2R target + flip", stop_min=0.75, max_day=2, daily_loss_pct=3.0, max_open=4, corr_guard=True,
+             ctx_filter=E.CTX_DEFAULT, alert_grade=os.environ.get("ALERT_GRADE") or "C", t1_r=E.T1_R)
+    syms = [x.strip().upper() for x in (os.environ.get("WATCHLIST") or DEFAULT_SYMBOLS).split(",") if x.strip()]
+    return dict(P=P, symbols=list(dict.fromkeys(syms)), every=300, telegram=True)
+
+
+def market_holiday(now):
+    try:
+        return now.date() in events.holidays()
+    except Exception:
+        return False
 
 
 def session_live(symbols, now):
@@ -55,6 +81,7 @@ def one_pass(cfg):
 
 def main():
     once = "--once" in sys.argv
+    cloud = "--cloud" in sys.argv  # scheduled cloud run: default settings, skip closed markets and holidays
     print("Background engine started. Settings from", paper.SETTINGS.name, "| Ctrl+C to stop")
     tok, chat = paper.telegram_creds()
     print("Telegram:", "configured" if tok and chat else "not configured (alerts logged in the app only)")
@@ -62,12 +89,20 @@ def main():
         try:
             cfg = paper.load_settings()
         except FileNotFoundError:
+            if cloud:
+                cfg = default_settings()
+            else:
+                cfg = None
+        if cfg is None:
             print("No saved settings yet: open the app > Paper trading & alerts > 'Save settings for background engine'.")
             if once:
                 return
             time.sleep(60)
             continue
         now = pd.Timestamp.now(tz=E.IST)
+        if cloud and (not session_live(cfg["symbols"], now) or market_holiday(now)):
+            print(f"[{now:%H:%M:%S}] markets closed or holiday: nothing to do")
+            return
         if once or session_live(cfg["symbols"], now):
             try:
                 one_pass(cfg)
