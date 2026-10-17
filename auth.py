@@ -142,10 +142,12 @@ def _fp(salt, pw):
 
 
 def make_token(username):
-    """Signed, stateless sign-in token tied to this user's current password."""
+    """Signed, stateless sign-in token tied to this user's current password. A random part makes every sign-in's
+    token unique, so Log out (which blocks that one token) ends only that device, not every future sign-in."""
     with _conn() as c:
         r = c.execute("SELECT salt, pw FROM users WHERE username=?", (username.lower(),)).fetchone()
-    payload = base64.urlsafe_b64encode(f"{username.lower()}:{_fp(r['salt'], r['pw'])}".encode()).decode().rstrip("=")
+    raw = f"{username.lower()}:{_fp(r['salt'], r['pw'])}:{secrets.token_hex(6)}"
+    payload = base64.urlsafe_b64encode(raw.encode()).decode().rstrip("=")
     sig = hmac.new(_secret(), payload.encode(), hashlib.sha256).hexdigest()[:40]
     return f"{payload}.{sig}"
 
@@ -156,7 +158,7 @@ def _token_user(token):
         payload, sig = token.split(".")
         if not hmac.compare_digest(sig, hmac.new(_secret(), payload.encode(), hashlib.sha256).hexdigest()[:40]):
             return None
-        username, fp = base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)).decode().split(":")
+        username, fp = base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)).decode().split(":")[:2]
     except Exception:
         return None
     with _conn() as c:
@@ -274,6 +276,27 @@ def _restore_js():
         f"+(w.location.protocol==='https:'?'; Secure':'');w.location.reload();}}}}catch(e){{}}</script>", height=1)
 
 
+_STORE = None
+
+
+def _store(action, value=""):
+    """Device sign-in store (components/srk_store): the remember-me token in this browser's localStorage, which the
+    Android WebView keeps. Needed because Streamlit Cloud's proxy does not pass our cookie on to the app.
+    Call at most once per run. -> stored token ('' when none), or None until the browser has answered."""
+    global _STORE
+    try:
+        if _STORE is None:
+            import streamlit.components.v1 as components
+            _STORE = components.declare_component("srk_store", path=str(Path(__file__).parent / "components" / "srk_store"))
+        return _STORE(action=action, value=value, key_name=COOKIE, key="srk_store", default=None)
+    except Exception:
+        return None
+
+
+def _skip_device_check():
+    st.session_state["store_skip"] = True
+
+
 def _no_pull_refresh():
     """Mobile: dragging down at the top of the page reloads it (pull-to-refresh). Keep drags as scrolls."""
     st.markdown("<style>html,body,[data-testid='stApp'],[data-testid='stAppViewContainer'],[data-testid='stMain']"
@@ -286,6 +309,8 @@ def _remember(user):
     st.session_state["user"] = user
     st.session_state["session_token"] = tok
     st.session_state["cookie_pending"] = tok
+    st.session_state.pop("logged_out", None)  # signed in again after a Log out: the device store may keep it again
+    st.session_state.pop("store_skip", None)
 
 
 # ---------------- Per-user watchlist ----------------
@@ -511,18 +536,22 @@ def gate():
     A remember-me cookie keeps the user signed in across reloads, reconnects and app restarts until Log out."""
     _no_pull_refresh()
     _seed_once()
+    logged_out = False
     if st.session_state.get("cookie_clear"):
         _cookie_js("", 0)
         st.session_state.pop("cookie_clear", None)
+        st.session_state["logged_out"] = True
+        logged_out = True
     if st.session_state.get("user"):
         pending = st.session_state.pop("cookie_pending", None)
+        tok = pending or st.session_state.get("session_token")
         if pending or not st.session_state.get("cookie_synced"):
-            # once per browser session: repairs a cookie write that didn't stick and renews its 30-day Max-Age
-            # (the server-side expiry slides on every visit, the cookie's did not)
-            tok = pending or st.session_state.get("session_token")
+            # once per browser session: repairs a cookie write that didn't stick and renews its Max-Age
             if tok:
                 _cookie_js(tok, SESSION_DAYS * 86400)
             st.session_state["cookie_synced"] = True
+        if tok:
+            _store("set", tok)  # device store: written once, then it only reports changes (no extra reruns)
         return st.session_state["user"]
     try:
         tok = st.context.cookies.get(COOKIE)
@@ -534,13 +563,32 @@ def gate():
     if u:
         st.session_state["user"] = u
         st.session_state["session_token"] = tok
-        _cookie_js(tok, SESSION_DAYS * 86400)  # renew Max-Age and the localStorage copy, reset the restore guard
+        _cookie_js(tok, SESSION_DAYS * 86400)  # renew Max-Age and the localStorage copy
         st.session_state["cookie_synced"] = True
+        _store("set", tok)
         return u
     if tok:
-        _cookie_js("", 0)  # revoked or expired token: clear it (and its localStorage copy) so restore can't loop
-    else:
-        _restore_js()
+        _cookie_js("", 0)  # revoked or expired token: clear it
+    # no usable cookie (Streamlit Cloud never passes it on): ask this device's store
+    stored = None if logged_out or st.session_state.get("logged_out") else _store("get")
+    if logged_out or st.session_state.get("logged_out"):
+        _store("clear")
+    if stored:
+        u = session_user(stored)
+        if u:
+            st.session_state.update(user=u, session_token=stored, cookie_pending=stored)
+            return u
+    st.html(f'<span id="srkdiag" style="display:none">cookie={"yes" if tok else "no"} '
+            f'store={"waiting" if stored is None else "token" if stored else "empty"}</span>')
+    if stored is None and not logged_out and not st.session_state.get("logged_out") \
+            and not st.session_state.get("store_skip"):
+        # first moment of a new visit: the device store answers within a second and signs you in
+        _, mid, _ = st.columns([1, 1.2, 1])
+        with mid:
+            st.markdown("## 📈 Intraday CALL / PUT Engine")
+            st.info("🔐 Checking this device's sign-in…")
+            st.button("Sign in with password instead", on_click=_skip_device_check)
+        st.stop()
     _, mid, _ = st.columns([1, 1.2, 1])
     with mid:
         st.markdown("## 📈 Intraday CALL / PUT Engine")
