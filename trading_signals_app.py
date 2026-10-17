@@ -27,7 +27,18 @@ def _local_modules():
 # Streamlit Cloud pulls new code into the running process and reruns only this script: helper modules (ui_kit,
 # engine, ...) imported earlier would stay the old version (AttributeError on anything new). If any of their files
 # changed since import, drop them all so the imports below load the new code together.
-if any(os.path.getmtime(m.__file__) > getattr(m, "_loaded_at", float("inf")) for m in _local_modules().values()):
+def _stale(m):
+    try:
+        changed = os.path.getmtime(m.__file__)
+        if hasattr(m, "_loaded_at"):
+            return changed > m._loaded_at
+        pyc = getattr(getattr(m, "__spec__", None), "cached", None)  # loaded by older code: compare with its .pyc
+        return bool(pyc) and os.path.exists(pyc) and changed > os.path.getmtime(pyc)
+    except OSError:
+        return False
+
+
+if any(_stale(m) for m in _local_modules().values()):
     for _n in _local_modules():
         sys.modules.pop(_n, None)
 
