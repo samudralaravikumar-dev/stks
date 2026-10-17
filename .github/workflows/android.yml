@@ -13,6 +13,8 @@ on:
 jobs:
   build:
     runs-on: ubuntu-24.04  # pinned: ubuntu-latest moves to Ubuntu 26 on 2026-10-19
+    permissions:
+      contents: write  # create the GitHub Release the app updates from
     steps:
       - uses: actions/checkout@v6
 
@@ -49,6 +51,7 @@ jobs:
             echo "SIGNING_STORE_FILE=$RUNNER_TEMP/signing.p12" >> "$GITHUB_ENV"
             echo "::add-mask::$pw"
             echo "SIGNING_STORE_PASSWORD=$pw" >> "$GITHUB_ENV"
+            echo "SIGNED=1" >> "$GITHUB_ENV"
           else
             echo "::warning::ANDROID_KEYSTORE_B64 / ANDROID_KEYSTORE_PASSWORD secrets not set: APK signed with a temporary debug key (uninstall the old app before installing)."
           fi
@@ -67,3 +70,23 @@ jobs:
           name: SRK-Options-apk-v1.1.${{ github.run_number }}
           path: SRK-Options-v1.1.${{ github.run_number }}.apk
           retention-days: 30
+
+      # The app's self-updater reads releases/latest/download/version.json and downloads SRK-Options.apk from the
+      # same release. Only key-signed builds are published: a debug-signed APK could not update the installed app.
+      - name: Publish release for in-app updates
+        if: env.SIGNED == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          N: ${{ github.run_number }}
+        run: |
+          tag="android-v1.1.$N"
+          cp "SRK-Options-v1.1.$N.apk" SRK-Options.apk
+          printf '{"versionCode": %s, "versionName": "1.1.%s", "apk": "https://github.com/%s/releases/download/%s/SRK-Options.apk"}\n' \
+            "$N" "$N" "$GITHUB_REPOSITORY" "$tag" > version.json
+          if gh release view "$tag" > /dev/null 2>&1; then
+            gh release upload "$tag" SRK-Options.apk version.json --clobber  # re-run of the same build
+          else
+            gh release create "$tag" SRK-Options.apk version.json --target "$GITHUB_SHA" --latest \
+              --title "SRK Options 1.1.$N" \
+              --notes "Android app build $N (${GITHUB_REF_NAME} @ ${GITHUB_SHA::7}). The app offers this update automatically."
+          fi

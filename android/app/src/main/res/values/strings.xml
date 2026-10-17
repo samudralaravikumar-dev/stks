@@ -8,4 +8,5 @@
     <string name="offline_detail">Check your internet connection. If the app was asleep it can take ~30 s to wake up.\n(%1$s)</string>
     <string name="retry">Retry</string>
     <string name="change">Change address</string>
+    <string name="check_update">Check for app update</string>
 </resources>

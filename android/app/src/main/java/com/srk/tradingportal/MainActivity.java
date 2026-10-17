@@ -27,7 +27,7 @@ import androidx.swiperefreshlayout.widget.SwipeRefreshLayout;
 /**
  * Full-screen shell around the Streamlit portal. The analysis engine runs on the server; this app shows it
  * like a native app: remembered portal address, offline screen with Retry, back navigation, external
- * links in the browser. Long-press the offline screen's "Change address" to point it somewhere else.
+ * links in the browser, self-update from GitHub Releases (see Updater). Long-press the offline screen's "Change address" to point it somewhere else.
  */
 public class MainActivity extends AppCompatActivity {
     private static final String PREFS = "portal";
@@ -38,6 +38,7 @@ public class MainActivity extends AppCompatActivity {
     private ProgressBar progress;
     private View offline;
     private String portalHost = "";
+    private Updater updater;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -54,6 +55,9 @@ public class MainActivity extends AppCompatActivity {
         swipe.setEnabled(false);
         ((Button) findViewById(R.id.retry)).setOnClickListener(v -> loadPortal());
         ((Button) findViewById(R.id.change)).setOnClickListener(v -> askForUrl(true));
+        updater = new Updater(this);
+        ((Button) findViewById(R.id.check_update)).setOnClickListener(v -> updater.check(true));
+        updater.checkIfDue();
 
         if (savedInstanceState != null) {
             web.restoreState(savedInstanceState);
@@ -176,6 +180,12 @@ public class MainActivity extends AppCompatActivity {
         } else {
             super.onBackPressed();
         }
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        updater.onResume();  // back from the "Install unknown apps" setting: continue the pending update
     }
 
     @Override
