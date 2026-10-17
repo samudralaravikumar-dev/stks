@@ -59,7 +59,9 @@ public class MainActivity extends AppCompatActivity {
         ((Button) findViewById(R.id.check_update)).setOnClickListener(v -> updater.check(true));
         updater.checkIfDue();
 
-        if (savedInstanceState != null) {
+        if (alertSymbol(getIntent()) != null && !savedUrl().isEmpty()) {
+            openSymbol(alertSymbol(getIntent()));
+        } else if (savedInstanceState != null) {
             web.restoreState(savedInstanceState);
         } else if (savedUrl().isEmpty()) {
             askForUrl(false);
@@ -148,6 +150,35 @@ public class MainActivity extends AppCompatActivity {
         offline.setVisibility(View.GONE);
         web.setVisibility(View.VISIBLE);
         web.loadUrl(url);
+    }
+
+    /** Symbol from an alert link srkoptions://open?sym=SBIN, or null. */
+    private static String alertSymbol(Intent intent) {
+        Uri u = intent == null ? null : intent.getData();
+        if (u == null || !"srkoptions".equals(u.getScheme())) {
+            return null;
+        }
+        String sym = u.getQueryParameter("sym");
+        return sym == null || !sym.matches("[A-Za-z0-9&_-]{1,20}") ? null : sym.toUpperCase();
+    }
+
+    /** Load the portal on one symbol's call (the portal reads ?sym= and shows that card first). */
+    private void openSymbol(String sym) {
+        String url = savedUrl();
+        portalHost = Uri.parse(url).getHost() == null ? "" : Uri.parse(url).getHost();
+        offline.setVisibility(View.GONE);
+        web.setVisibility(View.VISIBLE);
+        web.loadUrl(Uri.parse(url).buildUpon().clearQuery().appendQueryParameter("sym", sym).build().toString());
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);  // app already open (singleTask): an alert tap arrives here
+        setIntent(intent);
+        String sym = alertSymbol(intent);
+        if (sym != null && !savedUrl().isEmpty()) {
+            openSymbol(sym);
+        }
     }
 
     private void showOffline(String why) {

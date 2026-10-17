@@ -285,6 +285,9 @@ st.markdown(ui_kit.CSS, unsafe_allow_html=True)
 with st.sidebar:
     st.markdown(f"### 👤 {user['name']}")
     st.selectbox("🎨 Colour scheme", list(theme.SCHEMES), format_func=theme.SCHEMES.get, key="color_scheme")
+    _focus = str(st.query_params.get("sym") or "").strip().upper()[:20]
+    if _focus and st.session_state.get("focus_seen") != _focus:  # opened from a phone alert: show that call first
+        st.session_state.update(simple_view=True, focus_sym=_focus, focus_seen=_focus, app_tab="Active calls")
     if "simple_view" not in st.session_state:
         ua = str(st.context.headers.get("User-Agent", "")) if hasattr(st, "context") else ""
         st.session_state["simple_view"] = bool(re.search(r"Android|iPhone|iPad|Mobile", ua))
@@ -317,6 +320,13 @@ with st.sidebar:
         returning = str(st.query_params.get("state", "")).startswith("upstox")
         sources = ["Upstox (live)", "Zerodha Kite (live)", "Yahoo + NSE (free, delayed)"]
         source = st.radio("Market data", sources, index=0 if (up_key or returning) else 2)
+        try:
+            import db
+            _where, _err = db.status()
+            st.caption(f"🗄 Journal: {_where}" + (f" · ⚠ shared database unreachable ({_err}): using this server's "
+                                                 "local file until it is back" if _err else ""))
+        except Exception:
+            pass
         if source.startswith("Upstox"):
             _tok, up_status, up_url = upstox_feed.session()
             if st.session_state.pop("upstox_token_save", None):
@@ -667,8 +677,17 @@ def simple_view():
             live += _horizon_calls(ok)
         except Exception:
             pass
+        focus = st.session_state.get("focus_sym")
+        if focus:
+            live.sort(key=lambda x: x[0] != focus)  # stable: the alerted symbol first, the rest keep their order
+            if not any(s == focus for s, _, _ in live):
+                st.info(f"🔔 {focus}: no active call right now (it may have been taken off or expired).")
         if live:
-            st.html('<div class="tk">' + "".join(ui_kit.call_card(s, r, view, d) for s, r, d in live) + '</div>')
+            for s, r, d in live:
+                ring = ' style="outline:2px solid #ffb400;outline-offset:2px;border-radius:16px"' if s == focus else ""
+                st.html(f'<div class="tk"><div{ring}>' + ui_kit.call_card(s, r, view, d) + '</div></div>')
+                if r.get("strike") or view == "Futures":  # tap the copy icon, paste into the broker's search
+                    st.code(ui_kit.contract_text(s, r, view), language=None)
         else:
             st.html('<div class="tk"><div class="empty2">No active CALL/PUT right now.<br>New calls appear here and '
                     'on your phone as alerts as soon as one forms.</div></div>')

@@ -4,6 +4,7 @@
 #
 # One-time setup (GitHub -> Settings -> Secrets and variables -> Actions):
 #   Secrets:   UPSTOX_ANALYTICS_TOKEN   (same token as in secrets.toml)      NTFY_TOPIC   (your ntfy topic)
+#              DATABASE_URL  (the Neon postgresql://... link: one journal/track record shared with the portal)
 #              optional: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 #   Variables: optional WATCHLIST (e.g. "NIFTY, BANKNIFTY, RELIANCE, CRUDE"), optional ALERT_GRADE (A/B/C/D),
 #              optional SCAN_UNIVERSE=fno to scan every NSE F&O stock (~210) as well (use ALERT_GRADE=B or A)
@@ -52,6 +53,7 @@ jobs:
         env:
           UPSTOX_ANALYTICS_TOKEN: ${{ secrets.UPSTOX_ANALYTICS_TOKEN }}
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           WATCHLIST: ${{ vars.WATCHLIST }}
@@ -62,6 +64,20 @@ jobs:
           if [ -z "$UPSTOX_ANALYTICS_TOKEN" ]; then echo "::warning::UPSTOX_ANALYTICS_TOKEN secret not set: using delayed Yahoo + NSE data"; fi
           if [ -z "$NTFY_TOPIC" ] && [ -z "$TELEGRAM_BOT_TOKEN" ]; then echo "::warning::No NTFY_TOPIC / TELEGRAM secrets: alerts are logged but not pushed"; fi
           python runner.py --once --cloud
+
+      - name: Alert the phone when this job fails (once an hour)
+        if: failure()
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: |
+          mkdir -p state
+          mark="state/job_failed_$(date +%Y%m%d%H)"
+          if [ -n "$NTFY_TOPIC" ] && [ ! -f "$mark" ]; then
+            touch "$mark"
+            curl -s -H "Title: SRK alerts job failed" -H "Tags: warning" -H "Priority: high" \
+              -d "The scheduled market scan failed, so alerts may be missing. Details: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+              "https://ntfy.sh/$NTFY_TOPIC" > /dev/null || true
+          fi
 
       - name: Save engine state
         if: always()

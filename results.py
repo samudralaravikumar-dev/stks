@@ -20,6 +20,7 @@ import engine as E
 import events
 import horizons as H
 import net
+import db
 import paper
 import upstox_feed as uf
 
@@ -166,7 +167,7 @@ def log(sym, result_date, imp, hist, verd, now):
     if not imp:
         return
     c = paper.conn()
-    c.execute(LOG_SQL)
+    c.executescript(LOG_SQL)
     c.execute("INSERT OR IGNORE INTO results_log(symbol, result_date, logged_at, spot, strike, straddle, implied_pct, "
               "expiry, hist_mean_pct, hist_n, verdict) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
               (sym, str(result_date), now.isoformat(timespec="seconds"), imp["spot"], imp["strike"], imp["straddle"],
@@ -178,7 +179,7 @@ def log(sym, result_date, imp, hist, verd, now):
 def score_log(now):
     """Fill in the actual reaction for logged results that have happened. -> rows scored."""
     c = paper.conn()
-    c.execute(LOG_SQL)
+    c.executescript(LOG_SQL)
     todo = c.execute("SELECT id, symbol, result_date, spot, implied_pct FROM results_log WHERE actual_pct IS NULL AND "
                      "result_date < ?", (now.date().isoformat(),)).fetchall()
     n = 0
@@ -206,7 +207,7 @@ def score_log(now):
 
 def log_df():
     c = paper.conn()
-    c.execute(LOG_SQL)
-    df = pd.read_sql_query("SELECT * FROM results_log ORDER BY result_date DESC", c)
+    c.executescript(LOG_SQL)
+    df = db.read_df(c, "SELECT * FROM results_log ORDER BY result_date DESC")
     c.close()
     return df

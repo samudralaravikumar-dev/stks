@@ -1047,6 +1047,8 @@ APP_CSS = """<style>
 .tk .rm b{display:block;font-size:15px;color:var(--txt);font-variant-numeric:tabular-nums}
 .tk .rm span{font-size:9.5px;letter-spacing:.06em;text-transform:uppercase;color:var(--mut)}
 .tk .rmx{margin:-4px 2px 12px;font-size:12.5px;font-weight:700}
+[data-testid="stCode"]{margin:-8px 0 14px}
+[data-testid="stCode"] pre{padding:6px 12px !important;font-size:13px}
 .tk .empty2{padding:26px 10px;text-align:center;color:var(--mut);font-size:13.5px}
 </style>"""
 
@@ -1069,6 +1071,14 @@ def _contract(r):
     e = str(r.get("expiry") or "")
     tag = " ".join(e.split("-")[:2]).upper() if e.count("-") == 2 else ""
     return f'{tag + " " if tag else ""}{(r.get("strike") or 0):g} {r.get("kind") or ""}'
+
+
+def contract_text(sym, r, view="Options"):
+    """Plain contract name to paste into a broker's search: 'SBIN 27 OCT 960 CE' or 'SBIN OCT FUT'."""
+    if view == "Futures":
+        e = str(r.get("expiry") or "")
+        return f"{sym} {e.split('-')[1].upper() + ' ' if e.count('-') == 2 else ''}FUT"
+    return f"{sym} {_contract(r)}".strip()
 
 
 def hero(title, subtitle, prices):

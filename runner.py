@@ -70,6 +70,53 @@ def session_live(symbols, now):
     return any(E.SESSIONS[s][0] <= now.time() <= E.SESSIONS[s][1] for s in sessions)
 
 
+def _age_min(d, now):
+    t = pd.Timestamp(d.index[-1])
+    t = t.tz_localize(E.IST) if t.tzinfo is None else t.tz_convert(E.IST)
+    return (now - t).total_seconds() / 60
+
+
+def health_events(results, now, token_set):
+    """Problems that would otherwise fail silently: no data, stale candles during the session, an Upstox token that
+    no longer works; plus one 'engine alive' ping per trading day. Each problem alerts at most once an hour."""
+    day, hr = now.date().isoformat(), now.strftime("%H")
+    ok = {s: a for s, a in results.items() if "error" not in a}
+    nse = {s: a for s, a in ok.items() if a["spec"]["sess"] == "nse"}
+    ev = []
+    if results and not ok:
+        first = next(iter(results.values())).get("error", "?")
+        ev.append((f"health:{day}:{hr}:nodata", "", "HEALTH",
+                   f"⚠ Engine health: no market data, all {len(results)} symbols failed ({first}). Signals are paused."))
+    if nse and now.weekday() < 5 and dtime(9, 45) <= now.time() <= dtime(15, 15):
+        stale = {s: _age_min(a["d"], now) for s, a in nse.items()}
+        stale = {s: m for s, m in stale.items() if m > (50 if nse[s].get("src") == "Yahoo" else 30)}  # Yahoo lags ~15 min
+        if len(stale) * 2 >= len(nse):
+            worst = max(stale.values())
+            ev.append((f"health:{day}:{hr}:stale", "", "HEALTH",
+                       f"⚠ Engine health: stale prices on {len(stale)}/{len(nse)} NSE symbols (newest candle up to "
+                       f"{worst:.0f} min old). Signals may be late or wrong."))
+        if token_set and not any(a.get("src") == "Upstox" for a in nse.values()):
+            ev.append((f"health:{day}:{hr}:token", "", "HEALTH",
+                       "⚠ Engine health: the Upstox token is set but not working, so the engine fell back to delayed "
+                       "Yahoo data. Generate a new analytics token on Upstox and update the UPSTOX_ANALYTICS_TOKEN "
+                       "secret (GitHub) and Streamlit secrets."))
+    try:
+        import db
+        where, err = db.status()
+        if err:
+            ev.append((f"health:{day}:{hr}:db", "", "HEALTH",
+                       f"⚠ Engine health: the shared database is unreachable ({err[:120]}). The engine is using a "
+                       "temporary local file, so the track record and loss limits may be incomplete."))
+    except Exception:
+        pass
+    if ok and now.weekday() < 5 and now.time() >= dtime(9, 15):
+        srcs = sorted({a.get("src", "?") for a in ok.values()})
+        ev.append((f"alive:{day}", "", "ALIVE",
+                   f"✅ SRK engine running · {', '.join(srcs)} data · {len(ok)}/{len(results)} symbols OK · "
+                   f"alerts at grade {os.environ.get('ALERT_GRADE') or 'C'} or better"))
+    return ev
+
+
 def one_pass(cfg):
     P, symbols = cfg["P"], cfg["symbols"]
     for k, v in paper.RISK_DEFAULTS.items():
@@ -93,6 +140,7 @@ def one_pass(cfg):
     new += paper.push_horizons(symbols, now, P.get("alert_grade", "C"), fx, send=send)  # BTST / 2-day before close
     new += paper.push_news(symbols, now, send=send)  # NSE corporate filings on watched symbols (context)
     new += paper.notify(paper.paper_step(results, P, now), send=send)
+    new += paper.notify(health_events(results, now, bool(uf.analytics_token())), send=send)
     src = "Upstox" if E.UPSTOX else "Kite" if E.KITE is not None else "Yahoo/NSE"
     board = "  ".join(f"{s}:{a.get('status', 'ERR')}" for s, a in results.items())
     print(f"[{now:%H:%M:%S}] {src} | {board}")
@@ -127,8 +175,14 @@ def main():
         if once or session_live(cfg["symbols"], now):
             try:
                 one_pass(cfg)
-            except Exception:
+            except Exception as e:
                 traceback.print_exc()
+                try:  # a crash must not be silent: tell the phone (once an hour)
+                    paper.notify([(f"health:{now.date()}:{now:%H}:crash", "", "HEALTH",
+                                   f"⚠ Engine health: scan crashed ({type(e).__name__}: {str(e)[:150]}). "
+                                   "Alerts may be missing until it is fixed.")], send=cfg.get("telegram", True))
+                except Exception:
+                    traceback.print_exc()
         else:
             print(f"[{now:%H:%M:%S}] markets closed, waiting…")
         if once:

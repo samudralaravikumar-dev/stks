@@ -12,12 +12,13 @@ import hmac
 import os
 import re
 import secrets
-import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
 
 import requests
 import streamlit as st
+
+import db
 
 DATA_DIR = Path(os.environ.get("TRAD_DATA_DIR") or Path(__file__).parent)
 DB = DATA_DIR / "users.db"
@@ -36,8 +37,11 @@ CREATE TABLE IF NOT EXISTS watchlist_sets(username TEXT, slot INTEGER, name TEXT
 
 
 def _conn():
-    c = sqlite3.connect(DB, timeout=10)
-    c.row_factory = sqlite3.Row
+    """Accounts database: the shared Postgres (Neon) when configured, else users.db (see db.py)."""
+    c = db.connect(DB, timeout=10)
+    if db.is_pg(c):
+        c.executescript(SCHEMA + "; CREATE UNIQUE INDEX IF NOT EXISTS ux_mobile ON users(mobile) WHERE mobile IS NOT NULL")
+        return c
     c.executescript(SCHEMA)
     if "mobile" not in [r[1] for r in c.execute("PRAGMA table_info(users)")]:  # upgrade older users.db
         c.execute("ALTER TABLE users ADD COLUMN mobile TEXT")
@@ -87,7 +91,7 @@ def create_user(username, password, name="", role="user", mobile=""):
             c.execute("INSERT INTO users(username, name, role, salt, pw, created, mobile) VALUES(?,?,?,?,?,?,?)",
                       (username.lower(), name or username, role, salt, _hash(password, salt),
                        datetime.now().isoformat(timespec="seconds"), mob))
-    except sqlite3.IntegrityError:
+    except db.IntegrityError:
         return "That username or mobile number is already registered"
     return None
 
@@ -100,7 +104,7 @@ def set_mobile(username, mobile):
         with _conn() as c:
             if not c.execute("UPDATE users SET mobile=? WHERE username=?", (mob, username.lower())).rowcount:
                 return "No such user"
-    except sqlite3.IntegrityError:
+    except db.IntegrityError:
         return "That mobile number belongs to another user"
     return None
 
@@ -180,7 +184,7 @@ def seed_users_from_secrets():
                                (str(u["username"]).lower(), u.get("name") or u["username"], u.get("role", "user"),
                                 u["salt"], u["pw"], datetime.now().isoformat(timespec="seconds"),
                                 u.get("mobile") or None)).rowcount
-            except (KeyError, sqlite3.IntegrityError):
+            except (KeyError, db.IntegrityError):
                 continue
     return n
 
@@ -234,8 +238,10 @@ def revoke_session(token):
         with _conn() as c:
             c.execute("DELETE FROM sessions WHERE token_hash=?", (_th(token),))
             if "." in token:  # signed token: mark it revoked (this device logged out)
-                c.execute("INSERT OR REPLACE INTO sessions(token_hash, username, created, expires, last_seen) "
-                          "VALUES(?, '__revoked__', ?, '9999-12-31', NULL)", (_th(token), datetime.now().isoformat()))
+                c.execute("INSERT INTO sessions(token_hash, username, created, expires, last_seen) "
+                          "VALUES(?, '__revoked__', ?, '9999-12-31', NULL) ON CONFLICT(token_hash) DO UPDATE SET "
+                          "username=excluded.username, created=excluded.created, expires=excluded.expires, "
+                          "last_seen=excluded.last_seen", (_th(token), datetime.now().isoformat()))
 
 
 def revoke_all_sessions(username):

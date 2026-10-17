@@ -1,13 +1,14 @@
 """
-Paper trading, trade journal and alerts. SQLite (trading.db) shared by the Streamlit app and runner.py;
-UNIQUE keys make every write idempotent, so the app and the background runner can both run.
+Paper trading, trade journal and alerts. One database shared by the Streamlit app and runner.py: trading.db, or the
+shared Postgres (Neon) when configured (db.py). UNIQUE keys make every write idempotent, so several copies can run.
 
 Trade rules mirror the backtest: enter on a signal at the live/model premium, book 50% at T1 and move the stop
 to cost, exit the rest at T2, on the premium/underlying stop, on a Supertrend flip, or at square-off.
 """
 import json
 import os
-import sqlite3
+import threading
+import time
 from datetime import datetime, time as dtime
 from pathlib import Path
 
@@ -15,6 +16,7 @@ import numpy as np
 import pandas as pd
 import requests
 
+import db
 import engine as E
 
 DATA_DIR = Path(os.environ.get("TRAD_DATA_DIR") or Path(__file__).parent)  # server: a persistent volume
@@ -41,8 +43,8 @@ CREATE TABLE IF NOT EXISTS alerts(
 
 
 def conn():
-    c = sqlite3.connect(DB, timeout=15)
-    c.row_factory = sqlite3.Row
+    """The journal database: the shared Postgres (Neon) when configured, else trading.db (see db.py)."""
+    c = db.connect(DB, timeout=15)
     c.executescript(SCHEMA)
     return c
 
@@ -278,7 +280,7 @@ def close_trade(trade_id, results, now, reason="manual exit (paper)"):
 
 def trades_df():
     c = conn()
-    df = pd.read_sql_query("SELECT * FROM trades ORDER BY id DESC", c)
+    df = db.read_df(c, "SELECT * FROM trades ORDER BY id DESC")
     c.close()
     num = ["strike", "dte0", "cal", "lot", "qty", "conf", "entry_u", "stop_u", "t1_u", "t2_u", "entry_p", "sl0", "sl_p",
            "t1_p", "t2_p", "half", "half_p", "last_p", "last_u", "exit_p", "pnl", "r_mult"]
@@ -329,24 +331,35 @@ def log_recs(items, now, source):
     return n
 
 
+_RESOLVED = {"t": 0.0, "rows": []}
+_RESOLVED_LOCK = threading.Lock()
+RESOLVED_TTL_S = 60
+
+
+def _resolved(days=60):
+    """Every resolved app call of the last `days` days in ONE query, reused for a minute: the credibility grade and the
+    TRADE/PAPER gate ask for each symbol on every refresh (one query each was slow over a remote database)."""
+    with _RESOLVED_LOCK:
+        if time.time() - _RESOLVED["t"] > RESOLVED_TTL_S or _RESOLVED.get("days") != days:
+            c = conn()
+            since = (pd.Timestamp.now() - pd.Timedelta(days=days)).date().isoformat()
+            rows = c.execute("SELECT symbol, kind, status, r_mult FROM recs WHERE day>=? AND mode IN ('now','trigger') "
+                             "AND status IN ('T1 HIT','T2 HIT','STOP HIT','SQUARED OFF') ORDER BY ts DESC",
+                             (since,)).fetchall()
+            c.close()
+            _RESOLVED.update(t=time.time(), days=days, rows=[dict(r) for r in rows])
+        return _RESOLVED["rows"]
+
+
 def live_record(sym, kind, days=60):
     """-> (target hits, resolved triggered calls) for one symbol/side over the last `days` days."""
-    c = conn()
-    since = (pd.Timestamp.now() - pd.Timedelta(days=days)).date().isoformat()
-    k, n = c.execute("SELECT SUM(status IN ('T1 HIT','T2 HIT')), COUNT(*) FROM recs WHERE symbol=? AND kind=? AND day>=? AND mode IN ('now','trigger') "
-                     "AND status IN ('T1 HIT','T2 HIT','STOP HIT','SQUARED OFF')", (sym, kind, since)).fetchone()
-    c.close()
-    return int(k or 0), int(n or 0)
+    rows = [r for r in _resolved(days) if r["symbol"] == sym and r["kind"] == kind]
+    return sum(r["status"] in ("T1 HIT", "T2 HIT") for r in rows), len(rows)
 
 
 def live_stats(sym, kind, days=60, last=5):
     """Forward record of this app's own calls on one symbol/side. -> dict(n, hits, avg_r, last_n, last_avg_r)."""
-    c = conn()
-    since = (pd.Timestamp.now() - pd.Timedelta(days=days)).date().isoformat()
-    rows = c.execute("SELECT status, r_mult FROM recs WHERE symbol=? AND kind=? AND day>=? AND mode IN ('now','trigger') "
-                     "AND status IN ('T1 HIT','T2 HIT','STOP HIT','SQUARED OFF') ORDER BY ts DESC",
-                     (sym, kind, since)).fetchall()
-    c.close()
+    rows = [x for x in _resolved(days) if x["symbol"] == sym and x["kind"] == kind]  # newest first
     r = [float(x["r_mult"]) for x in rows if x["r_mult"] is not None]
     tail = r[:last]
     return dict(n=len(rows), hits=sum(x["status"] in ("T1 HIT", "T2 HIT") for x in rows),
@@ -471,7 +484,7 @@ def evaluate_recs(get_bars, now, days=7):
 
 def recs_df(days=30):
     c = conn()
-    df = pd.read_sql_query("SELECT * FROM recs WHERE day>=? ORDER BY ts DESC", c,
+    df = db.read_df(c, "SELECT * FROM recs WHERE day>=? ORDER BY ts DESC",
                            params=((datetime.now() - pd.Timedelta(days=days)).date().isoformat(),))
     c.close()
     return df
@@ -516,12 +529,27 @@ def ntfy_target():
     return (server.rstrip("/"), topic) if topic else (None, None)
 
 
-def send_ntfy(text, title=None, tags=None, priority=None):
-    """Phone push through ntfy (install the ntfy app and subscribe to the topic). True when delivered."""
+def portal_url():
+    return (os.environ.get("PORTAL_URL") or _secret("app", "url") or "https://srktrade.streamlit.app").rstrip("/")
+
+
+def call_links(sym):
+    """(app link, web link) that open this symbol's call: srkoptions:// opens the Android app, https the browser."""
+    from urllib.parse import quote
+    q = quote(str(sym))
+    return f"srkoptions://open?sym={q}", f"{portal_url()}/?sym={q}"
+
+
+def send_ntfy(text, title=None, tags=None, priority=None, sym=None):
+    """Phone push through ntfy (install the ntfy app and subscribe to the topic). True when delivered.
+    sym: tapping the notification opens that symbol's call in the SRK app; a button opens it in the browser."""
     server, topic = ntfy_target()
     if not topic:
         return False
     hdr = {k: v for k, v in (("Title", title), ("Tags", tags), ("Priority", priority)) if v}
+    if sym:
+        app, web = call_links(sym)
+        hdr.update({"Click": app, "Actions": f"view, Open in browser, {web}"})
     try:
         r = requests.post(f"{server}/{topic}", data=text.encode("utf-8"),
                           headers={k: v.encode("utf-8").decode("latin-1") for k, v in hdr.items()}, timeout=8)
@@ -530,15 +558,17 @@ def send_ntfy(text, title=None, tags=None, priority=None):
         return False
 
 
-def push(text, title=None, tags=None, priority=None):
+def push(text, title=None, tags=None, priority=None, sym=None):
     """Send to every configured channel (Telegram and/or ntfy). True if any delivered."""
-    a = send_telegram(text if not title else f"{title}\n{text}")
-    b = send_ntfy(text, title, tags, priority)
+    tg = text if not title else f"{title}\n{text}"
+    a = send_telegram(tg + (f"\nOpen: {call_links(sym)[1]}" if sym else ""))
+    b = send_ntfy(text, title, tags, priority, sym)
     return a or b
 
 
 ALERT_TAGS = {"SIGNAL": "chart_with_upwards_trend", "ENTRY": "inbox_tray", "T1": "dart", "EXIT": "outbox_tray",
-              "NEWS": "newspaper"}
+              "NEWS": "newspaper", "HEALTH": "warning", "ALIVE": "white_check_mark"}
+LINKED = {"SIGNAL", "ENTRY", "T1", "EXIT", "BLOCKED", "HORIZON", "NEWS"}  # alerts about one symbol: tap opens its call
 
 
 def push_signals(items, now, min_grade="C", send=True):
@@ -627,7 +657,8 @@ def notify(events, send=True):
                         (stamp, key, sym, kind, text))
         if cur.rowcount:
             new.append((key, sym, kind, text))
-            if send and push(text, tags=ALERT_TAGS.get(kind), priority="high" if kind == "SIGNAL" else None):
+            if send and push(text, tags=ALERT_TAGS.get(kind), priority="high" if kind in ("SIGNAL", "HEALTH") else None,
+                             sym=sym if sym and kind in LINKED else None):
                 c.execute("UPDATE alerts SET sent=1 WHERE key=?", (key,))
     c.commit()
     c.close()
@@ -636,7 +667,7 @@ def notify(events, send=True):
 
 def alerts_df(limit=100):
     c = conn()
-    df = pd.read_sql_query("SELECT id, ts, symbol, kind, text, sent FROM alerts ORDER BY id DESC LIMIT ?", c,
+    df = db.read_df(c, "SELECT id, ts, symbol, kind, text, sent FROM alerts ORDER BY id DESC LIMIT ?",
                            params=(limit,))
     c.close()
     return df
@@ -669,8 +700,7 @@ def save_chain_snaps(results, now, width=10):
     """Store each symbol's option chain (summary + the +/-width strikes around spot) at most every 15 minutes.
     Builds the history that IV-rank and OI build-up signals need before they can be back-tested. -> rows saved."""
     c = conn()
-    c.execute(SNAP_SQL)
-    c.execute("CREATE INDEX IF NOT EXISTS ix_snaps ON chain_snaps(symbol, ts)")
+    c.executescript(SNAP_SQL + "; CREATE INDEX IF NOT EXISTS ix_snaps ON chain_snaps(symbol, ts)")
     stamp, n = now.isoformat(timespec="seconds"), 0
     cutoff = (now - pd.Timedelta(minutes=SNAP_EVERY_MIN - 1)).isoformat(timespec="seconds")
     for sym, a in results.items():
@@ -697,8 +727,8 @@ def save_chain_snaps(results, now, width=10):
 def chain_history(symbol, days=365):
     """-> DataFrame of saved snapshots for one symbol (newest last)."""
     c = conn()
-    c.execute(SNAP_SQL)
+    c.executescript(SNAP_SQL)
     since = (pd.Timestamp.now() - pd.Timedelta(days=days)).date().isoformat()
-    df = pd.read_sql_query("SELECT * FROM chain_snaps WHERE symbol=? AND day>=? ORDER BY ts", c, params=(symbol, since))
+    df = db.read_df(c, "SELECT * FROM chain_snaps WHERE symbol=? AND day>=? ORDER BY ts", params=(symbol, since))
     c.close()
     return df
