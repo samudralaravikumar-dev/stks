@@ -1,9 +1,11 @@
 # Port is passed by run.bat / Dockerfile (8502) so this file also works on Streamlit Community Cloud,
 # which assigns its own port.
+# Base theme = Upstox palette (sampled from upstox.com). The sidebar "Colour scheme" switch recolours the portal's
+# own components per session (theme.py); "Classic" restores the original navy look.
 
 [theme]
 base = "dark"
-primaryColor = "#22c55e"
-backgroundColor = "#0b1220"
-secondaryBackgroundColor = "#111c31"
-textColor = "#e6edf7"
+primaryColor = "#8a5cc7"
+backgroundColor = "#140b1d"
+secondaryBackgroundColor = "#1d1029"
+textColor = "#f1edf7"

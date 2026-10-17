@@ -16,6 +16,7 @@ import engine as E  # noqa: E402
 import auth  # noqa: E402
 import paper  # noqa: E402
 import pro  # noqa: E402
+import theme  # noqa: E402
 import ui_kit  # noqa: E402
 import symbols  # noqa: E402
 import upstox_feed  # noqa: E402
@@ -236,6 +237,8 @@ def price_check():
 
 
 # ---------------- UI ----------------
+theme.install()  # colour scheme (Upstox purple by default): recolours HTML, CSS and charts per session
+theme.apply_native()
 user = auth.gate()
 
 st.markdown("""<style>
@@ -248,6 +251,7 @@ st.markdown(ui_kit.CSS, unsafe_allow_html=True)
 
 with st.sidebar:
     st.markdown(f"### 👤 {user['name']}")
+    st.selectbox("🎨 Colour scheme", list(theme.SCHEMES), format_func=theme.SCHEMES.get, key="color_scheme")
     st.caption(f"@{user['username']} · {user['role']}")
     cu1, cu2 = st.columns(2)
     with cu1.popover("🔑 Password", use_container_width=True):
