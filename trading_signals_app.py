@@ -705,7 +705,9 @@ def simple_view():
         st.html(ui_kit.section("Warnings"))
         for w in warn[:8]:
             st.caption(w)
-    st.button("🖥 Open the full dashboard", on_click=_full_view, use_container_width=True)
+    # this screen is a fragment: a click reruns only the fragment, so force a full-app rerun to leave it
+    if st.button("🖥 Open the full dashboard", on_click=_full_view, use_container_width=True, key="open_full"):
+        st.rerun(scope="app")
     st.caption(f"Updated {now:%H:%M} IST" + (f" · refreshes every {every // 60} min" if auto else "")
                + " · educational signals, not advice.")
 
