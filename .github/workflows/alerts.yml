@@ -5,7 +5,8 @@
 # One-time setup (GitHub -> Settings -> Secrets and variables -> Actions):
 #   Secrets:   UPSTOX_ANALYTICS_TOKEN   (same token as in secrets.toml)      NTFY_TOPIC   (your ntfy topic)
 #              optional: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
-#   Variables: optional WATCHLIST (e.g. "NIFTY, BANKNIFTY, RELIANCE, CRUDE"), optional ALERT_GRADE (A/B/C/D)
+#   Variables: optional WATCHLIST (e.g. "NIFTY, BANKNIFTY, RELIANCE, CRUDE"), optional ALERT_GRADE (A/B/C/D),
+#              optional SCAN_UNIVERSE=fno to scan every NSE F&O stock (~210) as well (use ALERT_GRADE=B or A)
 #
 # State (alert de-duplication, paper journal, track record, option-chain snapshots) is kept between runs in the
 # Actions cache. GitHub may start scheduled runs a few minutes late and pauses schedules after 60 days without
@@ -28,6 +29,7 @@ jobs:
     env:
       TZ: Asia/Kolkata
       TRAD_DATA_DIR: ${{ github.workspace }}/state
+      UPSTOX_MAX_WAIT: "300"  # queue for Upstox's per-minute / 30-minute budget instead of failing
     steps:
       - uses: actions/checkout@v6
 
@@ -54,6 +56,7 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           WATCHLIST: ${{ vars.WATCHLIST }}
           ALERT_GRADE: ${{ vars.ALERT_GRADE }}
+          SCAN_UNIVERSE: ${{ vars.SCAN_UNIVERSE }}
         run: |
           mkdir -p state
           if [ -z "$UPSTOX_ANALYTICS_TOKEN" ]; then echo "::warning::UPSTOX_ANALYTICS_TOKEN secret not set: using delayed Yahoo + NSE data"; fi

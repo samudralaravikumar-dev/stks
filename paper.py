@@ -483,7 +483,7 @@ def push_signals(items, now, min_grade="C", send=True):
     ev = []
     for sym, r in items:
         c = (r or {}).get("cred")
-        if not r or r.get("mode") != "now" or not c or rank[c["grade"]] > rank.get(min_grade, 2):
+        if not r or r.get("mode") != "now" or not c or rank[c["grade"]] > rank.get(min_grade, 2) or r.get("allow_block"):
             continue
         ce = r["kind"] == "CE"
         rr = r.get("rr")
@@ -493,6 +493,9 @@ def push_signals(items, now, min_grade="C", send=True):
                 + ("" if r.get("live") else " (model premium)")
                 + f"\nUnderlying {r['u_entry']:,.2f} → SL {r['u_sl']:,.2f} · T1 {r['u_t1']:,.2f} · T2 {r['u_t2']:,.2f}"
                 + (f"\nR:R 1:{rr[0]:.1f} / 1:{rr[1]:.1f}" if rr else "")
+                + (f"\nLimit buy ≤ ₹{r['limit']:.2f} (spread {r.get('spread_pct', 0):.1f}%"
+                   + (")" if r.get("spread_ok", True) else ", wide: skip or wait)") if r.get("limit") else "")
+                + (f"\nSize: {r['size_note']} · ₹{r.get('cost_lot', 0):,.0f} premium/lot" if r.get("size_note") else "")
                 + f"\nCredibility {c['grade']} ({c['score']}/100) · T1 odds {c['p_t1'] * 100:.0f}%"
                 + (f" · weak: {', '.join(c['fails'][:3])}" if c.get("fails") else "")
                 + (f"\n{r['invalid']}" if r.get("invalid") else "")

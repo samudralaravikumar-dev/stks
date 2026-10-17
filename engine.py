@@ -919,6 +919,8 @@ def option_backtest(d, spec, P, ivr=1.3, cost=0.015):
         dr, j0 = int(sig[i]), i + 1
         kind, S0, R = ("CE" if dr > 0 else "PE"), o[j0], dist[i]
         exp, iv = next_expiry(idx[j0], weekly, mcx_day), max(vol[i] * ivr, 0.08)
+        if ROLL_DTE[0] <= (exp - idx[j0]).days <= ROLL_DTE[1]:  # same expiry roll as live calls
+            exp = next_expiry(exp + pd.Timedelta(days=1), weekly, mcx_day)
         atm = round(S0 / step) * step
         K = min((atm + k * step for k in range(-8, 9) if atm + k * step > 0),
                 key=lambda k: abs(abs(bs(S0, k, yrs(idx[j0], exp), iv, kind, r)[1]) - P["delta"]))
@@ -1094,11 +1096,22 @@ def _oi_open():
     return {}  # first OI seen per contract today -> ΔOI for Kite (Kite quotes carry no previous-day OI)
 
 
+# Expiry roll: when the nearest expiry is 3-7 days away, trade the next one. On real Upstox option prices (41
+# symbols, 120 days, 1,200 trades) contracts 3-7 days from expiry lost -6.9% of premium per trade versus about -2%
+# further out, and rolling them lifted the average from -2.27% to -1.39% (train -4.3% -> -3.3%, test +1.6% -> +2.1%).
+ROLL_DTE = (3, 7)
+
+
 def get_chain(spec, ltp, now):
     if UPSTOX:
         u = uf.underlying(spec["name"], spec["kind"], kite_day())
         if u and u["chain_key"]:
             raw = uf.option_chain(UPSTOX, u["chain_key"], kite_day())
+            if raw:
+                dte = (datetime.strptime(raw["expiry"], "%d-%b-%Y").date() - now.date()).days
+                if ROLL_DTE[0] <= dte <= ROLL_DTE[1]:  # decaying week: price the next expiry instead
+                    nxt = (datetime.strptime(raw["expiry"], "%d-%b-%Y").date() + pd.Timedelta(days=1)).isoformat()
+                    raw = uf.option_chain(UPSTOX, u["chain_key"], kite_day(), min_expiry=nxt) or raw
             if raw:  # Upstox supplies IV, greeks and previous-day OI directly
                 return summarize_chain(raw["quotes"], raw["spot"] or ltp, raw["expiry"], raw["lot"], "Upstox")
     if KITE is not None:
@@ -1212,6 +1225,15 @@ def analyze(sym, P, vix, fx, now):
     sa = side_analysis(spec, row, ltp, P, chain, iv, now, tg)
     bt_trades, bt = backtest(d, spec, P)
     obt_trades, obt = option_backtest(d, spec, P)  # same signals scored on the option premium (model)
+    rbt_trades, rbt = None, None
+    if UPSTOX and spec["kind"] != "commodity" and P.get("real_bt", True):  # REAL premiums (Upstox expired options)
+        try:
+            import optdata  # lazy: optdata imports engine
+            keyp = repr(sorted((k, str(P.get(k))) for k in ("interval", "ctx_filter", "win_end", "t1_r", "delta", "rr",
+                                                             "setups", "th", "max_day")))
+            rbt_trades, rbt = optdata.daily_real_bt(sym, now.date().isoformat(), keyp, d, spec, P, UPSTOX)
+        except Exception:
+            rbt_trades, rbt = None, None
     if plan and (bt is None or bt["trades"] < 15 or bt["exp"] <= 0):
         notes.append("These rules have NO proven edge on this symbol's loaded history "
                      + (f"({bt['trades']} trades, {bt['exp']:+.2f} R each)" if bt else "(no trades)")
@@ -1227,7 +1249,8 @@ def analyze(sym, P, vix, fx, now):
         conf = min(conf, 25)
     return dict(spec=spec, d=d, ltp=ltp, row=row, status=status, conf=conf, why=why, ctx=ctx, notes=notes, plan=plan,
                 chain=chain, news=news, ns=ns, iv=iv, iv_src=iv_src, has_vol=has_vol, bt=bt, bt_trades=bt_trades,
-                tg=tg, sa=sa, src=src, events=ev, obt=obt, obt_trades=obt_trades)
+                tg=tg, sa=sa, src=src, events=ev, obt=obt, obt_trades=obt_trades, rbt=rbt,
+                rbt_trades=rbt_trades)
 
 
 @st.cache_data(ttl=90, show_spinner=False, max_entries=300)
@@ -1566,14 +1589,15 @@ def credibility(a, r, P):
         add("pass" if n >= 30 and lo > 0 else "warn" if R.mean() > 0 and n >= 15 else "fail", 3, "Back-test edge",
             f"{n} trades, {R.mean():+.2f}R avg, 95% floor {lo:+.2f}R" + ("" if n >= 30 else " (small sample)"))
     # 1b. The same signals scored on the option premium (Black-Scholes model, theta and costs included)
-    ob = a.get("obt")
+    ob, real = (a.get("rbt"), True) if a.get("rbt") else (a.get("obt"), False)
     if not ob:
         add("n/a", 2, "Option back-test", "no past signals to price")
     else:
         n = ob["trades"]
+        how = "on REAL Upstox option prices" if real else "with a pricing model (no real option history)"
         add("pass" if n >= 20 and ob["floor"] > 0 else "warn" if ob["avg"] > 0 and n >= 10 else "fail", 2,
-            "Option back-test", f"{n} trades priced as options: {ob['avg'] * 100:+.1f}% of premium avg, "
-            f"{ob['win'] * 100:.0f}% winners, PF {ob['pf']:.2f} (model IV, 1.5% costs, expiry-day trades excluded)")
+            "Option back-test", f"{n} past trades {how}: {ob['avg'] * 100:+.1f}% of premium avg, "
+            f"{ob['win'] * 100:.0f}% winners, PF {ob['pf']:.2f} (1.5% costs)")
     # 2. T1 hit rate for this side (and this setup when it has enough history)
     hits = nt = 0
     if tr is not None and not tr.empty:
@@ -1698,7 +1722,43 @@ def recommend(a, P):
                         f"({'support' if ce else 'resistance'} lost)")
         r["cred"] = credibility(a, r, P)
         r["conf"] = min(r["conf"], r["cred"]["score"])
+        r.update(execution(a, r, P))
     return r
+
+
+SIZE_BY_GRADE = {"A": 1.0, "B": 0.5, "C": 0.25, "D": 0.0}
+
+
+def execution(a, r, P):
+    """How to act on a call: a limit price from the live bid/ask (never a market order), a skip warning when the spread
+    is wide, and lots scaled by the credibility grade (A full risk budget, B half, C quarter, D paper only).
+    Real option back-tests showed spreads and weak setups are where the losses come from."""
+    out = {}
+    q = ((a.get("chain") or {}).get("quotes") or {}).get(r.get("strike"), {}).get(r.get("kind")) or {}
+    bid, ask = q.get("bid") or 0, q.get("ask") or 0
+    if bid > 0 and ask >= bid:
+        mid = (bid + ask) / 2
+        if r.get("mode") == "now":  # a trigger plan's entry premium is only known when the trigger trades
+            out["limit"] = round(round(min(ask, mid + 0.25 * (ask - bid)) / 0.05) * 0.05, 2)  # a little above mid
+        out["spread_pct"] = (ask - bid) / mid * 100
+        out["spread_ok"] = out["spread_pct"] <= 3
+    lot = P.get("lot") or (a.get("chain") or {}).get("lot") or a["spec"].get("lot") or 1
+    risk_lot = max((r.get("prem") or 0) - (r.get("sl") or 0), 0) * lot
+    budget = P.get("capital", 0) * P.get("risk_pct", 1) / 100
+    g = (r.get("cred") or {}).get("grade", "D")
+    lots = int(budget * SIZE_BY_GRADE.get(g, 0) // risk_lot) if risk_lot > 0 else 0
+    rb = a.get("rbt")  # optional allowlist: only symbols whose signals made money on REAL option prices
+    real_ok = None if not rb or rb["trades"] < 12 else rb["avg"] > 0
+    if P.get("allowlist") and real_ok is False:
+        out.update(lot_size=lot, lots=0, risk_lot=risk_lot, cost_lot=(r.get("prem") or 0) * lot, allow_block=True,
+                   size_note=f"off: this symbol's signals lost on real option prices ({rb['avg'] * 100:+.1f}% per trade)")
+        return out
+    out.update(lot_size=lot, lots=lots, risk_lot=risk_lot, cost_lot=(r.get("prem") or 0) * lot,
+               size_note=(f"{lots} lot{'s' if lots != 1 else ''} × {lot} (grade {g}: "
+                          f"{int(SIZE_BY_GRADE.get(g, 0) * 100)}% of the ₹{budget:,.0f} risk budget)" if lots else
+                          f"paper only (grade {g})" if SIZE_BY_GRADE.get(g, 0) == 0 else
+                          f"1 lot risks ₹{risk_lot:,.0f}, above the ₹{budget * SIZE_BY_GRADE.get(g, 0):,.0f} budget for grade {g}"))
+    return out
 
 
 CRED_RANK = {"A": 0, "B": 1, "C": 2, "D": 3}

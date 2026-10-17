@@ -347,11 +347,10 @@ with st.sidebar:
         use_time = st.checkbox("NSE entry window", True)
         c1, c2 = st.columns(2)
         win_start = c1.time_input("From", dtime(9, 30), step=300)
-        win_end = c2.time_input("To", dtime(11, 0), step=300,
-                                help="New entries only until this time (ICICI Direct's rule for stock calls). In a 41-symbol, "
-                                     "120-day option-priced test, stopping at 11:00 improved both the selection and the "
-                                     "unseen period (-1.5% -> -0.8% and +2.1% -> +2.9% of premium per trade), "
-                                     "win rate ~63%, with ~57% of the trades. Set 14:45 for more signals.")
+        win_end = c2.time_input("To", dtime(14, 45), step=300,
+                                help="New entries only until this time. On REAL option prices (41 symbols, 120 days) "
+                                     "entries until 14:45 did better than ICICI's 11:00 rule in both halves of the test "
+                                     "(-4.3% vs -4.9% and +1.6% vs +1.1% of premium per trade), with ~65% more trades.")
         orb_cut = st.time_input("ORB valid until", dtime(13, 0), step=900)
         ctx_filter = st.multiselect("Confirmation filters", list(E.CTX_FILTERS), list(E.CTX_DEFAULT),
                                     format_func=E.CTX_FILTERS.get,
@@ -367,6 +366,10 @@ with st.sidebar:
         target_delta = st.slider("Target |delta|", 0.35, 0.80, 0.55, 0.05)
         exit_mode = st.selectbox("Exit after T1", ["2R target + flip", "Run to close"])
         rr = st.slider("Final target (R multiple)", 1.5, 4.0, 2.0, 0.5)
+        allowlist = st.toggle("Only symbols profitable on real option prices", False,
+                              help="Hide alerts and size 0 for symbols whose past signals lost money on real Upstox "
+                                   "option prices (needs 12+ past trades). Off by default: on unseen dates such symbols "
+                                   "averaged +1.3% vs +2.5% for the profitable ones, a modest gap on few trades.")
         t1_r = st.select_slider("Book half at (R multiple)", [0.5, 0.75, 1.0], E.T1_R,
                                 help="T1: book 50% and move the stop to breakeven. 0.5R raised the win rate from ~47% to "
                                      "~60% in an option-priced 120-day test with similar profit per trade; 1.0R wins less "
@@ -411,7 +414,7 @@ P = dict(interval=interval, period=period, th=th, adx_min=adx_min, lookback=look
          win_start=win_start, win_end=win_end, orb_cut=tmin(orb_cut), capital=capital, risk_pct=risk_pct,
          strike_mode=strike_mode, delta=target_delta, rr=rr, atr_mult=atr_mult, max_loss=max_loss, hold=hold,
          dte=dte, iv=iv_over, step=step_over, lot=lot_over, cost_pct=cost_pct, chain=use_chain, news=use_news,
-         setups=set(setups_on), exit_mode=exit_mode, stop_min=stop_min, max_day=max_day, ctx_filter=tuple(ctx_filter), alert_grade=alert_grade, t1_r=t1_r,
+         setups=set(setups_on), exit_mode=exit_mode, stop_min=stop_min, max_day=max_day, ctx_filter=tuple(ctx_filter), alert_grade=alert_grade, t1_r=t1_r, allowlist=allowlist,
          daily_loss_pct=daily_loss_pct, max_open=max_open, corr_guard=corr_guard)
 SYMBOLS = list(dict.fromkeys(s.strip().upper() for s in names.split(",") if s.strip()))
 
@@ -822,8 +825,22 @@ def analysis_tab():
             st.line_chart(t.set_index("exit_time").R.cumsum().rename("Cumulative R"))
             st.dataframe(t, width="stretch", hide_index=True)
             st.caption("R = multiples of the initial underlying risk after costs; underlying move only (no theta/IV).")
+        rt, rs_ = a.get("rbt_trades"), a.get("rbt")
+        if rs_:
+            st.markdown("**Same signals on REAL option prices** (Upstox expired + live contracts)")
+            k = st.columns(5)
+            k[0].metric("Real trades", rs_["trades"])
+            k[1].metric("Winners", f"{rs_['win'] * 100:.0f}%")
+            k[2].metric("Avg per trade", f"{rs_['avg'] * 100:+.1f}% of premium")
+            k[3].metric("Profit factor", f"{rs_['pf']:.2f}")
+            k[4].metric("T1 reached", f"{rs_['t1'] * 100:.0f}%")
+            st.dataframe(rt, width="stretch", hide_index=True,
+                         column_config={"pnl_pct": st.column_config.NumberColumn("P&L % of premium", format="%+.2f")})
+            st.caption("Each trade bought the delta-0.55 strike at its real 15-min open (the next expiry when the nearest "
+                       "was 3-7 days away) and exited at the contract's real prices: stop at the bar low, targets and "
+                       "square-off at the bar close (conservative), 1.5% round-trip costs.")
         ot, os_ = a.get("obt_trades"), a.get("obt")
-        st.markdown("**Same signals priced as options**")
+        st.markdown("**Same signals priced with a model**" + (" (for comparison)" if rs_ else ""))
         if not os_:
             st.info("No option-priced trades (or only expiry-day trades) in this history.")
         else:
@@ -1564,9 +1581,20 @@ def nifty50_tab():
         return
     names = dict(zip(lst.Symbol, lst["Company Name"]))
     inds = dict(zip(lst.Symbol, lst.Industry))
+    uni = st.segmented_control("Universe", ["NIFTY 50", "All F&O stocks"], default="NIFTY 50", key="n50_uni",
+                               help="All F&O stocks scans every NSE stock with options (~210): about 1-2 minutes on "
+                                    "Upstox. More setups, so more of them clear grade A/B.") or "NIFTY 50"
+    syms = list(lst.Symbol)
+    if uni == "All F&O stocks":
+        u = symbols.universe()
+        fno = u[u.kind == "fno"]
+        syms = list(dict.fromkeys(fno.symbol))
+        names = names | dict(zip(fno.symbol, fno.name))
     data = st.session_state.get("n50")
+    if data and data.get("uni", "NIFTY 50") != uni:
+        data = None
     c1, c2, c3 = st.columns([2, 3, 3], vertical_alignment="center")
-    run = c1.button("🔄 Scan NIFTY 50" if data else "▶ Scan all 50 stocks", type="primary", use_container_width=True)
+    run = c1.button(f"🔄 Scan {uni}" if data else f"▶ Scan {len(syms)} stocks", type="primary", use_container_width=True)
     filt = c2.segmented_control("Show", ["All", "CALL", "PUT", "No trade"], default="All", key="n50_filter",
                                 label_visibility="collapsed")
     if data:
@@ -1578,8 +1606,7 @@ def nifty50_tab():
             vix, _ = last_close("^INDIAVIX")
             fx, _ = last_close("USDINR=X")
         Pn = dict(P, news=False)
-        bar = st.progress(0.0, text="Scanning NIFTY 50…")
-        syms = list(lst.Symbol)
+        bar = st.progress(0.0, text=f"Scanning {uni}…")
         out = E.analyze_many(syms, Pn, vix, fx, now,
                              progress=lambda i, n, s: bar.progress(i / n, text=f"Scanned {i}/{n} · {s}"))
         bar.empty()
@@ -1611,7 +1638,8 @@ def nifty50_tab():
                     "Credibility": f"{r['cred']['grade']} · {r['cred']['score']}", "T1 odds": round(r["cred"]["p_t1"] * 100),
                     "Event": ev})
         paper.log_recs([(s, recommend(a, Pn)) for s, a in out.items() if "error" not in a], now, "nifty50")
-        data = dict(rows=rows, time=now, src="Upstox" if E.UPSTOX else "Kite" if E.KITE is not None else "Yahoo/NSE")
+        data = dict(rows=rows, time=now, src="Upstox" if E.UPSTOX else "Kite" if E.KITE is not None else "Yahoo/NSE",
+                    uni=uni)
         st.session_state["n50"] = data
     if not data:
         st.info("Press **Scan all 50 stocks** to get a CALL / PUT recommendation with targets for every NIFTY 50 stock "
@@ -1735,6 +1763,44 @@ def track_tab():
         st.caption("Judged on live 5-min prices with ICICI Direct's own rules: entered only if price trades within ±0.25% "
                    "of the entry (otherwise 'not triggered', like their 'not initiated'), then stop vs target within the "
                    "same session. Intraday calls only. Over a few weeks this shows each source's real hit rate.")
+        st.markdown("**📄 Or upload a broker's research PDF** (e.g. ICICI Direct Momentum Picks, HDFC Securities "
+                    "Intraday Pick): its calls are read out for you to review and track.")
+        up = st.file_uploader("Broker PDF", type=["pdf"], key="broker_pdf", label_visibility="collapsed")
+        if up is not None:
+            import broker_import
+            src_name = st.text_input("Source name", value=re.sub(r"[_\-]+", " ", up.name.rsplit(".", 1)[0])[:40],
+                                     key="broker_pdf_src")
+            try:
+                calls = broker_import.parse_pdf(up.getvalue())
+            except Exception as e:
+                calls = None
+                st.error(f"Couldn't read that PDF: {e}")
+            if calls is not None and calls.empty:
+                st.warning("No calls with a stock, BUY/SELL, entry, target and stop-loss were found in this PDF.")
+            elif calls is not None:
+                calls.insert(0, "track", calls.duration.str.lower().eq("intraday") | calls.duration.eq(""))
+                ed = st.data_editor(calls.drop(columns=["entry_hi"]), hide_index=True, width="stretch", key="broker_pdf_ed",
+                                    column_config={"track": st.column_config.CheckboxColumn("Track", default=False),
+                                                   "line": st.column_config.TextColumn("From the PDF", width="large")},
+                                    disabled=["name", "duration", "line"])
+                st.caption("Check each row (the stock name is matched to an NSE symbol; fix it if it's wrong). Intraday "
+                           "calls are ticked by default; positional ones are judged on the same session only.")
+                if st.button(f"Track {int(ed.track.sum())} selected call(s)", type="primary", key="broker_pdf_go"):
+                    sel = ed[ed.track]
+                    res = st.session_state.get("last_results", {})
+                    missing = [x for x in dict.fromkeys(sel.symbol) if x not in res]
+                    if missing:  # engine view for the agreement flag (light: no option chain, no news)
+                        res = {**res, **E.analyze_many(missing, dict(P, chain=False, news=False), None, None, now)}
+                    added = 0
+                    for r in sel.itertuples():
+                        a = res.get(r.symbol)
+                        rec = recommend(a, P) if a and "error" not in a else None
+                        ek = rec.get("kind") if rec and rec.get("mode") != "none" else None
+                        agree = ("engine agrees" if ek == ("CE" if r.side == "BUY" else "PE") else
+                                 "engine disagrees" if ek else "engine neutral")
+                        added += paper.add_broker_call(r.symbol, r.side, r.entry, r.stop, r.t1, r.t2,
+                                                       f"{src_name} · {agree}", now)
+                    st.success(f"Tracking {added} call(s) from {src_name}. See Type → Broker calls.")
     if df.empty:
         st.info("No recommendations logged for this filter yet. They are recorded automatically as the dashboard, "
                 "NIFTY 50 scan and stock search show BUY CALL / BUY PUT ideas.")

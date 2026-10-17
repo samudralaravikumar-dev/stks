@@ -8,3 +8,4 @@ feedparser
 vaderSentiment
 requests
 kiteconnect
+pypdf==6.19.0

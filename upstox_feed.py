@@ -41,6 +41,40 @@ UNITS = {"1m": 1, "5m": 5, "15m": 15}
 PERIOD_DAYS = {"5d": 7, "7d": 9, "1mo": 31, "30d": 31, "60d": 60}
 _last = [0.0]
 _rate_lock = threading.Lock()
+# Upstox enforces 25 requests/s, 250/min and 1000/30 min per API and per user
+# (https://upstox.com/developer/api-documentation/rate-limiting). Stay just under each, per endpoint group.
+LIMITS = ((1.0, 20), (60.0, 240), (1800.0, 950))
+_calls = {}  # endpoint group -> sorted call times (last 30 min)
+MAX_WAIT_S = float(os.environ.get("UPSTOX_MAX_WAIT", "15"))  # background jobs set this high to queue instead
+
+
+def _group(path):
+    """'/v2/expired-instruments/historical-candle/NSE_FO%7C1/15minute/..' -> '/v2/expired-instruments/historical-candle'"""
+    parts = [p for p in path.split("/") if p]
+    keep = 3 if len(parts) > 1 and parts[1] in ("expired-instruments", "market-quote", "option") else 2
+    return "/" + "/".join(parts[:keep])
+
+
+def _reserve(path):
+    """Block until this endpoint group has budget under all three limits; raise if that would take > MAX_WAIT_S."""
+    g = _group(path)
+    while True:
+        with _rate_lock:
+            now = time.time()
+            ts = [t for t in _calls.get(g, []) if now - t < 1800]
+            wait = max(_last[0] + 0.05 - now, 0.0)
+            for span, cap in LIMITS:
+                recent = [t for t in ts if now - t < span]
+                if len(recent) >= cap:
+                    wait = max(wait, recent[-cap] + span - now)
+            if wait <= 0:
+                ts.append(now)
+                _calls[g] = ts
+                _last[0] = now
+                return
+        if wait > MAX_WAIT_S:
+            raise RuntimeError(f"Upstox rate budget for {g} exhausted: retry in {wait:.0f}s")
+        time.sleep(min(wait, 2.0))
 
 
 def credentials():
@@ -76,13 +110,19 @@ def login_url():
 
 def api(token, path, params=None):
     """GET an Upstox endpoint -> 'data' payload. Raises on HTTP/API errors. Thread-safe."""
-    with _rate_lock:  # space calls out across the scan threads to stay well under the per-second limits
-        wait = _last[0] + 0.12 - time.time()
-        if wait > 0:
-            time.sleep(wait)
-        _last[0] = time.time()
-    r = net.session("upstox").get(API + path, params=params, timeout=12,
-                                  headers={"Accept": "application/json", "Authorization": f"Bearer {token}"})
+    waited = 0.0
+    while True:
+        _reserve(path)  # per-endpoint budget under Upstox's per-second, per-minute and per-30-minute limits
+        r = net.session("upstox").get(API + path, params=params, timeout=12,
+                                      headers={"Accept": "application/json", "Authorization": f"Bearer {token}"})
+        if r.status_code != 429:
+            break
+        # Upstox counts every call by this user (other processes too): back off, then retry within MAX_WAIT_S
+        pause = min(30.0, 5.0 * (1 + waited / 30))
+        if waited + pause > MAX_WAIT_S:
+            raise RuntimeError(f"Upstox {path}: 429 rate limit (retry later)")
+        time.sleep(pause)
+        waited += pause
     j = r.json()
     if not r.ok or j.get("status") != "success":
         raise RuntimeError(f"Upstox {path}: {r.status_code} {str(j)[:200]}")
@@ -293,12 +333,18 @@ def quotes(token, keys):
     return out
 
 
+@st.cache_data(ttl=6 * 3600, show_spinner=False, max_entries=1000)
+def _contracts(token, chain_key, day):
+    """Option contracts (expiries, strikes, lot sizes) for an underlying: they don't change within a day."""
+    return api(token, "/v2/option/contract", {"instrument_key": chain_key})
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def option_chain(token, chain_key, day, min_expiry=None):
     """Nearest expiry chain (or the first expiry on/after min_expiry 'YYYY-MM-DD') -> dict(expiry 'DD-Mon-YYYY', lot, quotes {strike: {CE/PE: ltp, bid, ask, iv, oi, doi,
     delta, theta, pop, gamma, vega, vol, cp (prev close), instrument_key}}, spot) or None."""
     try:
-        contracts = api(token, "/v2/option/contract", {"instrument_key": chain_key})
+        contracts = _contracts(token, chain_key, day)
         floor = max(date.today().isoformat(), min_expiry or "")
         exps = sorted({c["expiry"] for c in contracts if c.get("expiry") and c["expiry"] >= floor})
         if not exps:

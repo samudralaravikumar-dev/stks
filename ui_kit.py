@@ -573,7 +573,11 @@ def reco_card(r, chg=None, spark=None, gamma=None):
                 f'<div class="num"><div class="l">Target 2</div><div class="v">{_f(x["t2"])}</div>{pc(x["t2"])}</div></div>'
                 + _ladder(x["u_sl"], x["u_entry"], x["u_t1"], x["u_t2"], r["ltp"])
                 + (f'<div class="size">⚖ Risk:reward 1:{x["rr"][0]:.1f} to T1 · 1:{x["rr"][1]:.1f} to T2 · '
-                   f'⛔ {escape(x["invalid"])}</div>' if x.get("rr") and x.get("invalid") else ""))
+                   f'⛔ {escape(x["invalid"])}</div>' if x.get("rr") and x.get("invalid") else "")
+                + (f'<div class="size">' + (f'🎯 Limit buy ≤ ₹{x["limit"]:,.2f} · ' if x.get("limit") else "")
+                   + f'spread {x["spread_pct"]:.1f}%' + ("" if x.get("spread_ok", True) else " ⚠ wide: skip or wait")
+                   + '</div>' if x.get("spread_pct") is not None else "")
+                + (f'<div class="size">📦 {escape(x["size_note"])}</div>' if x.get("size_note") else ""))
 
     if r["mode"] == "none":
         up, dn = r.get("alt") or (None, None)
@@ -996,4 +1000,9 @@ def mini_call(sym, r):
             f'<div class="r">{cell("Entry", r.get("prem"))}{cell("Stop", r.get("sl"))}{cell("T1", r.get("t1"))}'
             f'{cell("T2", r.get("t2"))}</div>'
             f'<div class="n">{escape(when)} · T1 odds {c.get("p_t1", 0) * 100:.0f}%'
-            + (f' · R:R 1:{rr[1]:.1f}' if rr else "") + (" · model premium" if not r.get("live") else "") + '</div></div>')
+            + (f' · R:R 1:{rr[1]:.1f}' if rr else "") + (" · model premium" if not r.get("live") else "") + '</div>'
+            + (f'<div class="n">' + (f'🎯 Limit buy ≤ ₹{r["limit"]:,.2f} · ' if r.get("limit") else "")
+               + f'spread {r["spread_pct"]:.1f}%' + ("" if r.get("spread_ok", True) else " ⚠ wide: skip or wait")
+               + '</div>' if r.get("spread_pct") is not None else "")
+            + (f'<div class="n">📦 {escape(r["size_note"])} · ₹{r.get("cost_lot", 0):,.0f} premium per lot</div>'
+               if r.get("size_note") else "") + '</div>')

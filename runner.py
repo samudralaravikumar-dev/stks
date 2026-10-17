@@ -27,13 +27,32 @@ def default_settings():
     """The app's default sidebar settings, for cloud runs with no saved engine_settings.json (GitHub Actions).
     Symbols come from env WATCHLIST (comma separated, e.g. a GitHub repository variable) or the default watchlist."""
     P = dict(interval="15m", period="60d", th=6.0, adx_min=20, lookback=3, use_time=True, win_start=dtime(9, 30),
-             win_end=dtime(11, 0), orb_cut=E.tmin(dtime(13, 0)), capital=200000, risk_pct=1.0,
+             win_end=dtime(14, 45), orb_cut=E.tmin(dtime(13, 0)), capital=200000, risk_pct=1.0,
              strike_mode="Delta target", delta=0.55, rr=2.0, atr_mult=1.5, max_loss=0.35, hold=1.0, dte=3, iv=0.0,
              step=0.0, lot=0, cost_pct=0.03, chain=True, news=False, setups={"VWAPPB", "STFLIP", "SQZ", "ORB"},
              exit_mode="2R target + flip", stop_min=0.75, max_day=2, daily_loss_pct=3.0, max_open=4, corr_guard=True,
              ctx_filter=E.CTX_DEFAULT, alert_grade=os.environ.get("ALERT_GRADE") or "C", t1_r=E.T1_R)
     syms = [x.strip().upper() for x in (os.environ.get("WATCHLIST") or DEFAULT_SYMBOLS).split(",") if x.strip()]
-    return dict(P=P, symbols=list(dict.fromkeys(syms)), every=300, telegram=True)
+    extra = []
+    if (os.environ.get("SCAN_UNIVERSE") or "").lower() == "fno":  # every NSE stock with options, beyond the watchlist
+        try:
+            import symbols
+            u = symbols.universe()
+            extra = [x for x in dict.fromkeys(u[u.kind == "fno"].symbol) if x not in syms]
+        except Exception:
+            extra = []
+    return dict(P=P, symbols=list(dict.fromkeys(syms)), extra=extra, every=300, telegram=True)
+
+
+def scan_extra(extra, P, vix, fx, now):
+    """Wide F&O scan within Upstox's rate limits: candles only for every symbol (no option chain, no news), then the
+    full analysis with option chain only for the few that show a CALL/PUT setup. Runs every 10 minutes."""
+    if not extra or now.minute % 10 >= 5:
+        return {}
+    light = E.analyze_many(extra, dict(P, chain=False, news=False), vix, fx, now, fn=E.analyze)
+    hot = [s for s, a in light.items() if "error" not in a and E.recommend(a, dict(P, chain=False))["mode"] != "none"]
+    print(f"    wide F&O scan: {len(extra)} symbols, {len(hot)} with a setup -> pricing their options")
+    return E.analyze_many(hot, dict(P, news=False), vix, fx, now, fn=E.analyze) if hot else {}
 
 
 def market_holiday(now):
@@ -62,12 +81,13 @@ def one_pass(cfg):
     vix, _ = E.last_close("^INDIAVIX")
     fx, _ = E.last_close("USDINR=X")
     results = E.analyze_many(symbols, dict(P, news=False), vix, fx, now, fn=E.analyze)
+    wide = scan_extra(cfg.get("extra") or [], P, vix, fx, now)  # alerts only: paper trades stay on the watchlist
     try:
         paper.save_chain_snaps(results, now)  # option-chain history for IV rank / OI build-up research
     except Exception:
         traceback.print_exc()
     send = cfg.get("telegram", True)
-    recs = [(s, E.recommend(a, P)) for s, a in results.items() if "error" not in a]
+    recs = [(s, E.recommend(a, P)) for s, a in {**wide, **results}.items() if "error" not in a]
     new = paper.push_signals(recs, now, P.get("alert_grade", "C"), send=send)  # CALL/PUT alerts to the phone
     new += paper.push_horizons(symbols, now, P.get("alert_grade", "C"), fx, send=send)  # BTST / 2-day before close
     new += paper.push_news(symbols, now, send=send)  # NSE corporate filings on watched symbols (context)
