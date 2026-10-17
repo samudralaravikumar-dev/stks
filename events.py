@@ -71,6 +71,9 @@ def flags(spec, chain, now):
         try:
             if datetime.strptime(chain["expiry"], "%d-%b-%Y").date() == today:
                 out.append(("high", "Expiry day: theta and gamma are extreme, prefer ITM strikes and quick exits"))
+                if today >= date(2026, 12, 7):  # SEBI, Oct 2026: settlement moves off the closing auction
+                    out.append(("info", "Expiring contracts settle at the VWAP of the last 30 minutes of trading, not "
+                                        "the close: positions held into the close settle near that average"))
         except ValueError:
             pass
     if spec.get("kind") == "commodity":
