@@ -22,3 +22,5 @@ push_android.bat
 trading.db
 users.db
 engine_settings.json
+
+streamlit_cloud_secrets.toml
