@@ -34,9 +34,21 @@ jobs:
           KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
         run: |
           if [ -n "$KEYSTORE_B64" ] && [ -n "$KEYSTORE_PASSWORD" ]; then
-            echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/signing.p12"
+            # tolerate copy-paste debris: line breaks/spaces in the key, a "Value:" label, padding around the password
+            b64=$(printf '%s' "$KEYSTORE_B64" | sed 's/^Value[^:]*://' | tr -d ' \t\r\n')
+            pw=$(printf '%s' "$KEYSTORE_PASSWORD" | sed 's/^Value:[[:space:]]*//' | tr -d '\r\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            if ! printf '%s' "$b64" | base64 -d > "$RUNNER_TEMP/signing.p12" 2>/dev/null; then
+              echo "::error::ANDROID_KEYSTORE_B64 is not valid base64 (${#b64} chars after trimming; expected 3504). Re-paste the long line from signing-secrets.txt."
+              exit 1
+            fi
+            if ! keytool -list -storetype pkcs12 -keystore "$RUNNER_TEMP/signing.p12" -storepass "$pw" -alias srk > /dev/null 2>&1; then
+              echo "::error::Signing key check failed: ANDROID_KEYSTORE_PASSWORD (${#pw} chars; expected 32) does not open the keystore from ANDROID_KEYSTORE_B64 (${#b64} chars; expected 3504). Re-paste both values from signing-secrets.txt."
+              exit 1
+            fi
+            echo "Signing key OK"
             echo "SIGNING_STORE_FILE=$RUNNER_TEMP/signing.p12" >> "$GITHUB_ENV"
-            echo "SIGNING_STORE_PASSWORD=$KEYSTORE_PASSWORD" >> "$GITHUB_ENV"
+            echo "::add-mask::$pw"
+            echo "SIGNING_STORE_PASSWORD=$pw" >> "$GITHUB_ENV"
           else
             echo "::warning::ANDROID_KEYSTORE_B64 / ANDROID_KEYSTORE_PASSWORD secrets not set: APK signed with a temporary debug key (uninstall the old app before installing)."
           fi
