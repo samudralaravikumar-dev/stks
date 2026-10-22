@@ -107,14 +107,16 @@ except Exception:
 
 
 def real_option_backtest(d, spec, P, token, cost=0.015, max_trades=None, roll="default", spread=None,
-                         time_stop=None):
+                         time_stop=None, trail=None, keep_t2=True):
     """The engine's signals with the same entries/exits as backtest() (next-bar entry, underlying stop / T1 half /
     T2, breakeven after T1, square-off), priced on the REAL option: the delta-0.55 strike of the nearest expiry on or
     after the trade day, entry at that contract's 15-min open, exits at the contract's prices on the exit bar
     (stop: bar low; target / T1 / square-off: bar close; conservative). -> (trades DataFrame, stats dict or None).
     spread='t2': a debit spread instead - also SELL the same-expiry option nearest the underlying's T2 level (max profit
     at the target); stops value it at long low / short high, other exits at both closes; costs on both legs.
-    time_stop=N: exit at the bar close N bars after entry when T1 has not been reached (stops theta bleed)."""
+    time_stop=N: exit at the bar close N bars after entry when T1 has not been reached (stops theta bleed).
+    trail=k: after T1 the stop trails the best underlying price reached so far by k x the initial stop distance (never
+    below cost); keep_t2=False lets the second half run to the trailing stop or the square-off instead of T2."""
     key = chain_key(spec)
     if not key:
         return pd.DataFrame(), None
@@ -176,6 +178,7 @@ def real_option_backtest(d, spec, P, token, cost=0.015, max_trades=None, roll="d
         net0 = p0 - q0
         per_day[days[i]] = per_day.get(days[i], 0) + 1
         half, booked, exit_v, why, j = False, 0.0, None, "", j0
+        peak = S0  # best underlying price since entry (updated after each bar: no peeking inside the bar)
 
         def val(bar, bar2, worst=False):  # position value: long leg minus short leg
             if obs is None:
@@ -189,12 +192,16 @@ def real_option_backtest(d, spec, P, token, cost=0.015, max_trades=None, roll="d
                 continue
             adv, fav = (l[j], h[j]) if dr > 0 else (h[j], l[j])
             stop_lvl = S0 if half else sl_u
+            if half and trail:
+                cand = peak - dr * trail * R
+                stop_lvl = cand if (cand - S0) * dr > 0 else S0
             if (adv - stop_lvl) * dr <= 0:
-                exit_v, why = val(bar, bar2, worst=True), "breakeven" if half else "stop"
+                exit_v = val(bar, bar2, worst=True)
+                why = ("trail stop" if stop_lvl != S0 else "breakeven") if half else "stop"
             else:
                 if not half and (fav - t1_u) * dr >= 0:
                     half, booked = True, 0.5 * (val(bar, bar2) - net0)
-                if (fav - t2_u) * dr >= 0:
+                if keep_t2 and (fav - t2_u) * dr >= 0:
                     exit_v, why = val(bar, bar2), "target"
                 elif time_stop and not half and j - j0 >= time_stop:
                     exit_v, why = val(bar, bar2), "time stop"
@@ -202,6 +209,8 @@ def real_option_backtest(d, spec, P, token, cost=0.015, max_trades=None, roll="d
                     exit_v, why = val(bar, bar2), "square-off"
             if exit_v is not None:
                 break
+            if (fav - peak) * dr > 0:
+                peak = fav
             j += 1
         if exit_v is None:
             i = j + 1
