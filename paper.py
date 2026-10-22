@@ -43,7 +43,8 @@ CREATE TABLE IF NOT EXISTS alerts(
 
 
 _MIGRATED = set()
-NEW_COLS = [("recs", "grade", "TEXT"), ("recs", "p_t1", "REAL")]  # added after the first release: calibration
+NEW_COLS = [("recs", "grade", "TEXT"), ("recs", "p_t1", "REAL"),  # calibration
+            ("trades", "proof", "INTEGER")]  # 1 = TRADE call (real-money limits), 0 = PAPER call (tracked only)  # added after the first release: calibration
 
 
 def conn():
@@ -106,14 +107,20 @@ def unrealized(df):
 
 
 RISK_DEFAULTS = dict(daily_loss_pct=2.0, max_open=3, max_trades_day=3, max_consec_loss=2, weekly_loss_pct=5.0)
+PAPER_LIMITS = dict(max_open_paper=6, max_paper_day=8)  # keeps the PAPER journal readable; no money is at stake
 
 
-def risk_status(P, now):
+def risk_status(P, now, scope="trade"):
     """Portfolio limits before opening anything new, from the app's trade journal: daily loss cap, max open positions,
     max new trades per day, stop after N losses in a row today, and half size after a bad week.
+    scope "trade": only positions from TRADE calls count (the real-money limits; journal rows from before the
+    TRADE/PAPER flag count too). PAPER calls never use up these slots: on 22 Oct three PAPER positions blocked the
+    day's only TRADE call. scope "paper": PAPER positions against their own, looser caps.
     -> dict(ok, reasons, pnl_today, open, limit, left, trades_today, streak, week_pnl, size_factor, open_index)."""
     g = lambda k: P.get(k, RISK_DEFAULTS[k])
     df = trades_df()
+    is_paper = df.proof.fillna(1) == 0
+    df = df[is_paper] if scope == "paper" else df[~is_paper]
     today = now.date().isoformat()
     monday = (now - pd.Timedelta(days=now.weekday())).date().isoformat()
     ex = df.exit_at.fillna("")
@@ -132,6 +139,14 @@ def risk_status(P, now):
             break
         streak += 1
     reasons = []
+    if scope == "paper":
+        if len(opn) >= P.get("max_open_paper", PAPER_LIMITS["max_open_paper"]):
+            reasons.append(f"{len(opn)} open PAPER positions = max {P.get('max_open_paper', 6)}")
+        if n_today >= P.get("max_paper_day", PAPER_LIMITS["max_paper_day"]):
+            reasons.append(f"{n_today} PAPER trades today = max {P.get('max_paper_day', 8)}")
+        return dict(ok=not reasons, reasons=reasons, pnl_today=pnl, open=len(opn), limit=0, left=None,
+                    trades_today=n_today, streak=streak, week_pnl=week_pnl, week_limit=0, size_factor=1.0,
+                    open_index=[(r.symbol, r.kind) for r in opn.itertuples() if r.symbol in INDEX_GROUP])
     if limit and pnl <= -limit:
         reasons.append(f"Daily loss limit hit: ₹{pnl:,.0f} vs limit -₹{limit:,.0f}. No new trades today.")
     if len(opn) >= g("max_open"):
@@ -209,15 +224,20 @@ def paper_step(results, P, now):
         if c.execute("SELECT 1 FROM trades WHERE status='OPEN' AND symbol=?", (sym,)).fetchone():
             continue
         c.commit()
-        rs = risk_status(P, now)
+        try:  # TRADE calls use the real-money limits; PAPER calls are journalled under their own caps
+            real = bool(E.proof(a, dict(sym=spec["name"], kind=p["kind"]))["trade"]) or not P.get("proof_gate", True)
+        except Exception:
+            real = True
+        rs = risk_status(P, now, "trade" if real else "paper")
         blocked = list(rs["reasons"])
-        if P.get("corr_guard", True) and sym in INDEX_GROUP and any(k == p["kind"] for _, k in rs["open_index"]):
+        if real and P.get("corr_guard", True) and sym in INDEX_GROUP and any(k == p["kind"] for _, k in rs["open_index"]):
             blocked.append(f"Already holding an index {p['kind']} ({', '.join(s for s, k in rs['open_index'])}): "
                            f"{sym} {p['kind']} would double the same bet")
         if any(sev == "high" and "result" in t.lower() for sev, t in a.get("events", [])):
             blocked.append(f"{sym} has results today/tomorrow: skipped to avoid IV crush")
         if blocked:
-            ev.append((f"block:{sym}:{row.name}", sym, "BLOCKED", f"⛔ {a['status']} {sym} not taken: " + blocked[0]))
+            if real:  # a skipped PAPER entry is not worth a phone alert
+                ev.append((f"block:{sym}:{row.name}", sym, "BLOCKED", f"⛔ {a['status']} {sym} not taken: " + blocked[0]))
             continue
         n_today = c.execute("SELECT COUNT(*) FROM trades WHERE symbol=? AND substr(opened_at,1,10)=?",
                             (sym, now.date().isoformat())).fetchone()[0]
@@ -228,15 +248,15 @@ def paper_step(results, P, now):
         model = E.bs(ltp, p["strike"], p["dte"] / 365, a["iv"], p["kind"], r)[0]
         cur = c.execute(
             "INSERT OR IGNORE INTO trades(symbol, kind, setup, signal_bar, opened_at, strike, expiry, dte0, cal, lot, qty, "
-            "conf, priced, entry_u, stop_u, t1_u, t2_u, entry_p, sl0, sl_p, t1_p, t2_p, last_p, last_u, updated_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "conf, priced, entry_u, stop_u, t1_u, t2_u, entry_p, sl0, sl_p, t1_p, t2_p, last_p, last_u, updated_at, proof) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (sym, p["kind"], row.Setups, str(row.name), stamp, p["strike"], p["expiry"], p["dte"],
              p["prem"] / model if model > 0.05 else 1.0, p["lot"], lots * p["lot"], a["conf"],
              "live" if p["live"] else "model", p["entry"], p["stop"], p["t1"], p["t2"], p["prem"], p["p_sl"],
-             p["p_sl"], p["p_t1"], p["p_t2"], p["prem"], ltp, stamp))
+             p["p_sl"], p["p_t1"], p["p_t2"], p["prem"], ltp, stamp, int(real)))
         if cur.rowcount:
             ev.append((f"entry:{sym}:{row.name}", sym, "ENTRY",
-                       f"{'📗' if p['kind'] == 'CE' else '📕'} {a['status']} {sym} {p['strike']:g} {p['kind']} "
+                       ("" if real else "📝 PAPER · ") + f"{'📗' if p['kind'] == 'CE' else '📕'} {a['status']} {sym} {p['strike']:g} {p['kind']} "
                        f"@ {p['prem']:.2f} · SL {p['p_sl']:.2f} · T1 {p['p_t1']:.2f} · T2 {p['p_t2']:.2f} · "
                        f"{lots} lot · {row.Setups} · conf {a['conf']}"))
     c.commit()
@@ -297,7 +317,9 @@ def trades_df():
     c = conn()
     df = db.read_df(c, "SELECT * FROM trades ORDER BY id DESC")
     c.close()
-    num = ["strike", "dte0", "cal", "lot", "qty", "conf", "entry_u", "stop_u", "t1_u", "t2_u", "entry_p", "sl0", "sl_p",
+    if "proof" not in df.columns:
+        df["proof"] = np.nan
+    num = ["proof", "strike", "dte0", "cal", "lot", "qty", "conf", "entry_u", "stop_u", "t1_u", "t2_u", "entry_p", "sl0", "sl_p",
            "t1_p", "t2_p", "half", "half_p", "last_p", "last_u", "exit_p", "pnl", "r_mult"]
     df[num] = df[num].apply(pd.to_numeric, errors="coerce")
     df["half"] = df.half.fillna(0).astype(int)

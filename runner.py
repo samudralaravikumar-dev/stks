@@ -117,6 +117,15 @@ def health_events(results, now, token_set):
     return ev
 
 
+def bars_for(sym):
+    """5-minute session bars (IST) + square-off minute: what evaluate_recs needs to score a logged call."""
+    spec = E.resolve(sym)
+    raw, src = E.get_prices(spec, "5m", "5d")
+    fx = E.last_close("USDINR=X")[0] if spec["kind"] == "commodity" else None
+    df, _ = E.prepare(raw, spec, "5m", fx if src == "Yahoo" else None)
+    return df, E.tmin(E.SESSIONS[spec["sess"]][2])
+
+
 def one_pass(cfg):
     P, symbols = cfg["P"], cfg["symbols"]
     for k, v in paper.RISK_DEFAULTS.items():
@@ -136,6 +145,13 @@ def one_pass(cfg):
     send = cfg.get("telegram", True)
     P.update(paper.risk_controls(P, now))  # halt / half size from the journal's loss limits
     recs = [(s, E.recommend(a, P)) for s, a in {**wide, **results}.items() if "error" not in a]
+    try:  # the track record: log every watchlist CALL/PUT (and filter-blocked ones), score them about once an hour
+        paper.log_recs([(s, r) for s, r in recs if s in results], now, "runner")
+        paper.log_recs([(s, E.blocked_rec(a, P)) for s, a in results.items() if "error" not in a], now, "blocked")
+        if now.minute < 6:
+            paper.evaluate_recs(bars_for, now)
+    except Exception:
+        traceback.print_exc()
     new = paper.push_signals(recs, now, P.get("alert_grade", "C"), send=send)  # CALL/PUT alerts to the phone
     new += paper.push_horizons(symbols, now, P.get("alert_grade", "C"), fx, send=send)  # BTST / 2-day before close
     new += paper.push_news(symbols, now, send=send)  # NSE corporate filings on watched symbols (context)
