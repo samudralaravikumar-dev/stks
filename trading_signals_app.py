@@ -1860,7 +1860,12 @@ def track_tab():
         else:
             cfg = dict(win_pct=st.column_config.NumberColumn("Win %", format="%.0f"),
                        avg_r=st.column_config.NumberColumn("Avg R", format="%+.2f"),
-                       total_r=st.column_config.NumberColumn("Total R", format="%+.2f"))
+                       total_r=st.column_config.NumberColumn("Total R", format="%+.2f"),
+                       real_n=st.column_config.NumberColumn("Priced", format="%d",
+                                                            help="Calls scored on the real option contract price"),
+                       real_avg=st.column_config.NumberColumn("Real option %", format="%+.1f",
+                                                              help="Average result on the real price of the exact "
+                                                                   "contract, after 1.5% costs"))
             w1, w2 = st.columns([3, 2])
             w1.dataframe(sc["week"].sort_values("week", ascending=False), hide_index=True, width="stretch", column_config=cfg)
             w2.dataframe(sc["kind"].replace({"CE": "CALL", "PE": "PUT"}), hide_index=True, width="stretch", column_config=cfg)

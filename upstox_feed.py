@@ -333,6 +333,53 @@ def quotes(token, keys):
     return out
 
 
+def _mcx_options(day, name):
+    """MCX option contracts of one commodity from the instrument master -> DataFrame with an IST expiry date."""
+    df = instruments("MCX", day)
+    o = df[df.instrument_type.isin(["CE", "PE"]) & (df.get("underlying_symbol") == MCX_MAP[name.upper()])].copy()
+    o["exp"] = pd.to_datetime(o.expiry, unit="ms", utc=True).dt.tz_convert("Asia/Kolkata").dt.date
+    return o
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def mcx_option_chain(token, name, day, min_expiry=None, width=12):
+    """MCX option chain built from the instrument master + live market quotes (Upstox's option-chain API covers NSE
+    only): nearest expiry on/after min_expiry, +/- `width` strikes around the underlying future.
+    -> dict(expiry 'DD-Mon-YYYY', lot, quotes {strike: {CE/PE: ltp, bid, ask, oi, doi, vol, cp, instrument_key}}, spot)
+    or None. IV and greeks are not supplied: the engine computes them from the prices."""
+    try:
+        o = _mcx_options(day, name)
+        floor = max(date.today(), date.fromisoformat(min_expiry) if min_expiry else date.today())
+        exps = sorted(e for e in o.exp.unique() if e >= floor)
+        if not exps:
+            return None
+        o = o[o.exp == exps[0]]
+        und = o.underlying_key.mode().iloc[0]  # the future these options settle into
+        spot = (quotes(token, [und]).get(und) or {}).get("last_price")
+        if not spot:
+            return None
+        strikes = sorted(o.strike_price.unique())
+        i = min(range(len(strikes)), key=lambda j: abs(strikes[j] - spot))
+        keep = set(strikes[max(i - width, 0):i + width + 1])
+        sel = o[o.strike_price.isin(keep)]
+        q = quotes(token, sel.instrument_key.tolist())
+        out = {}
+        for r in sel.itertuples():
+            v = q.get(r.instrument_key)
+            if not v:
+                continue
+            buy, sell = (v.get("depth") or {}).get("buy") or [{}], (v.get("depth") or {}).get("sell") or [{}]
+            out.setdefault(float(r.strike_price), {})[r.instrument_type] = dict(
+                ltp=v.get("last_price") or 0.0, bid=buy[0].get("price") or 0.0, ask=sell[0].get("price") or 0.0,
+                oi=v.get("oi") or 0, doi=0, vol=v.get("volume"), cp=(v.get("ohlc") or {}).get("close"),
+                iv=0.0, delta=None, theta=None, instrument_key=r.instrument_key)
+        if not out:
+            return None
+        return dict(expiry=exps[0].strftime("%d-%b-%Y"), lot=int(sel.lot_size.iloc[0]), quotes=out, spot=float(spot))
+    except Exception:
+        return None
+
+
 @st.cache_data(ttl=6 * 3600, show_spinner=False, max_entries=1000)
 def _contracts(token, chain_key, day):
     """Option contracts (expiries, strikes, lot sizes) for an underlying: they don't change within a day."""

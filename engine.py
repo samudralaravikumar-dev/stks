@@ -1102,7 +1102,34 @@ def _oi_open():
 ROLL_DTE = (3, 7)
 
 
+def _mcx_chain(spec, ltp, now):
+    """Live MCX option chain (Upstox quotes) with IV from the prices: real premiums for CRUDE / NATURALGAS calls."""
+    raw = uf.mcx_option_chain(UPSTOX, spec["name"], kite_day())
+    if raw:
+        dte = (datetime.strptime(raw["expiry"], "%d-%b-%Y").date() - now.date()).days
+        if ROLL_DTE[0] <= dte <= ROLL_DTE[1]:
+            nxt = (datetime.strptime(raw["expiry"], "%d-%b-%Y").date() + pd.Timedelta(days=1)).isoformat()
+            raw = uf.mcx_option_chain(UPSTOX, spec["name"], kite_day(), min_expiry=nxt) or raw
+    if not raw:
+        return None
+    S = raw["spot"] or ltp
+    T = option_dte(dict(expiry=raw["expiry"], exp_hm=(23, 30)), {"dte": 0}, now) / 365
+    for k, sides in raw["quotes"].items():
+        for side, q in sides.items():
+            px = (q["bid"] + q["ask"]) / 2 if q["bid"] > 0 and q["ask"] >= q["bid"] else q["ltp"]
+            v = implied_vol(px, S, k, T, side, 0.0) if px else None
+            q["iv"] = round(v * 100, 1) if v else 0.0
+    return summarize_chain(raw["quotes"], S, raw["expiry"], raw["lot"], "Upstox MCX", (23, 30))
+
+
 def get_chain(spec, ltp, now):
+    if UPSTOX and spec["kind"] == "commodity":
+        try:
+            ch = _mcx_chain(spec, ltp, now)
+            if ch:
+                return ch
+        except Exception:
+            pass
     if UPSTOX:
         u = uf.underlying(spec["name"], spec["kind"], kite_day())
         if u and u["chain_key"]:
@@ -1761,6 +1788,8 @@ def execution(a, r, P):
     Real option back-tests showed spreads and weak setups are where the losses come from."""
     out = {}
     q = ((a.get("chain") or {}).get("quotes") or {}).get(r.get("strike"), {}).get(r.get("kind")) or {}
+    if q.get("instrument_key"):
+        out["ikey"] = q["instrument_key"]  # the exact contract: lets the track record score the call on its real price
     bid, ask = q.get("bid") or 0, q.get("ask") or 0
     if bid > 0 and ask >= bid:
         mid = (bid + ask) / 2

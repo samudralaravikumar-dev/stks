@@ -9,7 +9,7 @@ import json
 import os
 import threading
 import time
-from datetime import datetime, time as dtime
+from datetime import date, datetime, time as dtime
 from pathlib import Path
 
 import numpy as np
@@ -44,7 +44,9 @@ CREATE TABLE IF NOT EXISTS alerts(
 
 _MIGRATED = set()
 NEW_COLS = [("recs", "grade", "TEXT"), ("recs", "p_t1", "REAL"),  # calibration
-            ("trades", "proof", "INTEGER")]  # 1 = TRADE call (real-money limits), 0 = PAPER call (tracked only)  # added after the first release: calibration
+            ("trades", "proof", "INTEGER"),
+            ("recs", "expiry", "TEXT"), ("recs", "ikey", "TEXT"),  # the exact contract, for real-price scoring
+            ("recs", "real_entry", "REAL"), ("recs", "real_exit", "REAL"), ("recs", "real_pct", "REAL")]  # 1 = TRADE call (real-money limits), 0 = PAPER call (tracked only)  # added after the first release: calibration
 
 
 def conn():
@@ -359,11 +361,12 @@ def log_recs(items, now, source):
             continue
         n += c.execute(
             "INSERT OR IGNORE INTO recs(ts, day, symbol, kind, mode, action, strike, prem, sl_p, t1_p, t2_p, u_entry, u_sl, "
-            "u_t1, u_t2, conf, score, source, status, grade, p_t1) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "u_t1, u_t2, conf, score, source, status, grade, p_t1, expiry, ikey) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (stamp, day, sym, r["kind"], r["mode"], r["action"], r["strike"], r["prem"], r["sl"], r["t1"], r["t2"],
              r["u_entry"], r["u_sl"], r["u_t1"], r["u_t2"], r.get("conf"), r.get("score"), source,
              "WAITING" if r["mode"] == "trigger" else "OPEN", (r.get("cred") or {}).get("grade"),
-             (r.get("cred") or {}).get("p_t1"))).rowcount
+             (r.get("cred") or {}).get("p_t1"), r.get("expiry"), r.get("ikey"))).rowcount
     c.commit()
     c.close()
     return n
@@ -413,8 +416,10 @@ def scorecard(days=28):
     df["r_mult"] = pd.to_numeric(df.r_mult, errors="coerce")
     df["win"] = df.r_mult > 0
     df["week"] = pd.to_datetime(df.day).dt.to_period("W-SUN").dt.start_time.dt.date
+    df["real_pct"] = pd.to_numeric(df["real_pct"], errors="coerce") if "real_pct" in df.columns else np.nan
     agg = lambda g: g.agg(calls=("r_mult", "size"), win_pct=("win", "mean"), avg_r=("r_mult", "mean"),
-                          total_r=("r_mult", "sum")).reset_index()
+                          total_r=("r_mult", "sum"), real_n=("real_pct", "count"),
+                          real_avg=("real_pct", "mean")).reset_index()
     out = {k: agg(df.groupby(k)) for k in ("week", "kind", "symbol")}
     for v in out.values():
         v["win_pct"] = v.win_pct * 100
@@ -530,6 +535,57 @@ def evaluate_recs(get_bars, now, days=7):
                   (res["status"], res["outcome"], res["triggered_at"], res["resolved_at"], res["exit_u"], res["r_mult"],
                    res["best_r"], res["worst_r"], now.isoformat(timespec="seconds"), rec["id"]))
         n += 1
+    c.commit()
+    c.close()
+    try:
+        score_real(now, days)
+    except Exception:
+        pass
+    return n
+
+
+REAL_COST_PCT = 1.5  # round-trip costs + slippage, % of premium (as in the real-price back-tests)
+
+
+def _bar_at(c, ts):
+    """The 15-minute option candle that contains timestamp ts (IST), or None."""
+    t = pd.Timestamp(ts)
+    t = t.tz_localize(E.IST) if t.tzinfo is None else t.tz_convert(E.IST)
+    x = c[c.index <= t]
+    return x.iloc[-1] if len(x) and t - x.index[-1] < pd.Timedelta(minutes=15) else None
+
+
+def score_real(now, days=7):
+    """Score resolved calls on the REAL price of the exact option contract (Upstox candles): bought at the open of
+    the bar when the call triggered, sold when its outcome happened (stop: that bar's low; target or square-off:
+    that bar's close), minus REAL_COST_PCT. Only past days (their candles are final). -> calls scored."""
+    if not E.UPSTOX:
+        return 0
+    import optdata  # lazy: optdata imports engine
+    c = conn()
+    since = (now - pd.Timedelta(days=days)).date().isoformat()
+    todo = c.execute("SELECT * FROM recs WHERE day>=? AND day<? AND ikey IS NOT NULL AND real_pct IS NULL AND "
+                     "triggered_at IS NOT NULL AND resolved_at IS NOT NULL AND status IN "
+                     "('T1 HIT','T2 HIT','STOP HIT','SQUARED OFF')", (since, now.date().isoformat())).fetchall()
+    today, n = now.date(), 0
+    for rec in todo:
+        try:
+            day = date.fromisoformat(rec["day"])
+            exp = datetime.strptime(rec["expiry"], "%d-%b-%Y").date() if rec["expiry"] else None
+            bars = optdata.candles(E.UPSTOX, rec["ikey"], day, bool(exp and exp < today))
+            if bars is None or bars.empty:
+                continue
+            b0, b1 = _bar_at(bars, rec["triggered_at"]), _bar_at(bars, rec["resolved_at"])
+            if b0 is None or b1 is None or b0.Open <= 0:
+                continue
+            entry = float(b0.Open)
+            exit_ = float(b1.Low) if rec["status"] == "STOP HIT" else float(b1.Close)
+            pct = (exit_ - entry) / entry * 100 - REAL_COST_PCT
+            c.execute("UPDATE recs SET real_entry=?, real_exit=?, real_pct=? WHERE id=?",
+                      (round(entry, 2), round(exit_, 2), round(pct, 2), rec["id"]))
+            n += 1
+        except Exception:
+            continue
     c.commit()
     c.close()
     return n
