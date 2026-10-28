@@ -47,7 +47,8 @@ _MIGRATED = set()
 NEW_COLS = [("recs", "grade", "TEXT"), ("recs", "p_t1", "REAL"),  # calibration
             ("trades", "proof", "INTEGER"),
             ("recs", "expiry", "TEXT"), ("recs", "ikey", "TEXT"),  # the exact contract, for real-price scoring
-            ("recs", "real_entry", "REAL"), ("recs", "real_exit", "REAL"), ("recs", "real_pct", "REAL")]  # 1 = TRADE call (real-money limits), 0 = PAPER call (tracked only)  # added after the first release: calibration
+            ("recs", "real_entry", "REAL"), ("recs", "real_exit", "REAL"), ("recs", "real_pct", "REAL"),
+            ("recs", "ai_score", "REAL")]  # 1 = TRADE call (real-money limits), 0 = PAPER call (tracked only)  # added after the first release: calibration
 
 
 def conn():
@@ -385,12 +386,12 @@ def log_recs(items, now, source):
             continue
         n += c.execute(
             "INSERT OR IGNORE INTO recs(ts, day, symbol, kind, mode, action, strike, prem, sl_p, t1_p, t2_p, u_entry, u_sl, "
-            "u_t1, u_t2, conf, score, source, status, grade, p_t1, expiry, ikey) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "u_t1, u_t2, conf, score, source, status, grade, p_t1, expiry, ikey, ai_score) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (stamp, day, sym, r["kind"], r["mode"], r["action"], r["strike"], r["prem"], r["sl"], r["t1"], r["t2"],
              r["u_entry"], r["u_sl"], r["u_t1"], r["u_t2"], r.get("conf"), r.get("score"), source,
              "WAITING" if r["mode"] == "trigger" else "OPEN", (r.get("cred") or {}).get("grade"),
-             (r.get("cred") or {}).get("p_t1"), r.get("expiry"), r.get("ikey"))).rowcount
+             (r.get("cred") or {}).get("p_t1"), r.get("expiry"), r.get("ikey"), r.get("ai_score"))).rowcount
     c.commit()
     c.close()
     return n
@@ -707,6 +708,14 @@ ALERT_TAGS = {"SIGNAL": "chart_with_upwards_trend", "ENTRY": "inbox_tray", "T1":
 LINKED = {"SIGNAL", "ENTRY", "T1", "EXIT", "BLOCKED", "HORIZON", "NEWS"}  # alerts about one symbol: tap opens its call
 
 
+def _ai_line(r):
+    try:
+        import ai_filter
+        return ai_filter.line(r.get("ai_score"))
+    except Exception:
+        return ""
+
+
 def push_signals(items, now, min_grade="C", send=True):
     """items: [(symbol, recommend() dict)]. One phone alert per symbol/side/day for each enter-now BUY CALL / BUY PUT
     whose credibility grade is min_grade or better ("D" = every signal). -> newly logged events."""
@@ -732,6 +741,7 @@ def push_signals(items, now, min_grade="C", send=True):
                 + (f"\n{'✅ TRADE' if r['proof']['trade'] else '📝 PAPER ONLY'}: {r['proof']['why']}" if r.get("proof") else "")
                 + f"\nCredibility {c['grade']} ({c['score']}/100) · T1 odds {c['p_t1'] * 100:.0f}%"
                 + (f" · weak: {', '.join(c['fails'][:3])}" if c.get("fails") else "")
+                + (f"\n{_ai_line(r)}" if r.get("ai_score") is not None else "")
                 + (f"\n{r['invalid']}" if r.get("invalid") else "")
                 + "\nPaper/educational signal, not advice. Confirm on your broker's chain.")
         ev.append((f"sig:{day}:{sym}:{r['kind']}", sym, "SIGNAL", text))

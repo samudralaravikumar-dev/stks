@@ -1787,6 +1787,11 @@ def recommend(a, P):
         r["cred"] = credibility(a, r, P)
         r["conf"] = min(r["conf"], r["cred"]["score"])
         r.update(execution(a, r, P))
+        try:
+            import ai_filter  # lazy: ai_filter imports engine. Shown and logged only; no effect on grade or lots
+            r["ai_score"] = ai_filter.score(a, r)
+        except Exception:
+            r["ai_score"] = None
     return r
 
 
