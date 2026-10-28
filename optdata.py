@@ -107,7 +107,7 @@ except Exception:
 
 
 def real_option_backtest(d, spec, P, token, cost=0.015, max_trades=None, roll="default", spread=None,
-                         time_stop=None, trail=None, keep_t2=True):
+                         time_stop=None, trail=None, keep_t2=True, opt_sl=None, wait_pct=None):
     """The engine's signals with the same entries/exits as backtest() (next-bar entry, underlying stop / T1 half /
     T2, breakeven after T1, square-off), priced on the REAL option: the delta-0.55 strike of the nearest expiry on or
     after the trade day, entry at that contract's 15-min open, exits at the contract's prices on the exit bar
@@ -116,7 +116,10 @@ def real_option_backtest(d, spec, P, token, cost=0.015, max_trades=None, roll="d
     at the target); stops value it at long low / short high, other exits at both closes; costs on both legs.
     time_stop=N: exit at the bar close N bars after entry when T1 has not been reached (stops theta bleed).
     trail=k: after T1 the stop trails the best underlying price reached so far by k x the initial stop distance (never
-    below cost); keep_t2=False lets the second half run to the trailing stop or the square-off instead of T2."""
+    below cost); keep_t2=False lets the second half run to the trailing stop or the square-off instead of T2.
+    opt_sl=x: also exit when the OPTION falls x (e.g. 0.3 = -30%) below its entry before T1 (filled at that level, or at
+    the bar open if it gaps through). wait_pct=w ("wait and trade"): enter only once the option trades w above its price
+    at the signal bar's close (filled at that level or the bar open), before the square-off; no trade otherwise."""
     key = chain_key(spec)
     if not key:
         return pd.DataFrame(), None
@@ -162,6 +165,18 @@ def real_option_backtest(d, spec, P, token, cost=0.015, max_trades=None, roll="d
         if p0 <= 0.5:
             i += 1
             continue
+        if wait_pct:  # wait for the option to confirm the move before buying
+            trig, jj = p0 * (1 + wait_pct), j0
+            while jj < n and days[jj] == day and mins[jj] < sqm:
+                b_ = ob.loc[idx[jj]] if idx[jj] in ob.index else None
+                if b_ is not None and float(b_.High) >= trig:
+                    break
+                jj += 1
+            if jj >= n or days[jj] != day or mins[jj] >= sqm or idx[jj] not in ob.index:
+                i = j0  # never confirmed: no trade from this signal
+                continue
+            p0 = max(trig, float(ob.loc[idx[jj], "Open"]))
+            j0 = jj
         sl_u, t1_u, t2_u = S0 - dr * R, S0 + dr * t1r * R, S0 + dr * t2d[i]
         obs, Ks, q0 = None, None, 0.0
         if spread:  # short leg: same expiry, strike nearest the underlying's T2, beyond the long strike
@@ -195,7 +210,9 @@ def real_option_backtest(d, spec, P, token, cost=0.015, max_trades=None, roll="d
             if half and trail:
                 cand = peak - dr * trail * R
                 stop_lvl = cand if (cand - S0) * dr > 0 else S0
-            if (adv - stop_lvl) * dr <= 0:
+            if opt_sl and not half and obs is None and float(bar.Low) <= p0 * (1 - opt_sl):
+                exit_v, why = min(p0 * (1 - opt_sl), float(bar.Open)), "premium stop"
+            elif (adv - stop_lvl) * dr <= 0:
                 exit_v = val(bar, bar2, worst=True)
                 why = ("trail stop" if stop_lvl != S0 else "breakeven") if half else "stop"
             else:
@@ -216,7 +233,8 @@ def real_option_backtest(d, spec, P, token, cost=0.015, max_trades=None, roll="d
             i = j + 1
             continue
         pnl = (booked + (0.5 if half else 1.0) * (exit_v - net0)) / net0 - cost * (p0 + q0) / net0
-        out.append(dict(entry_time=idx[j0], side="CALL" if dr > 0 else "PUT", expiry=exp, strike=K, prem=round(p0, 2),
+        out.append(dict(entry_time=idx[j0], exit_time=idx[j], side="CALL" if dr > 0 else "PUT", expiry=exp, strike=K,
+                        prem=round(p0, 2),
                         short_strike=Ks, net_debit=round(net0, 2), dte=(exp - day).days, exit_reason=why,
                         t1_hit=half, pnl_pct=round(pnl * 100, 2)))
         i = j + 1

@@ -384,7 +384,7 @@ def _resolved(days=60):
         if time.time() - _RESOLVED["t"] > RESOLVED_TTL_S or _RESOLVED.get("days") != days:
             c = conn()
             since = (pd.Timestamp.now() - pd.Timedelta(days=days)).date().isoformat()
-            rows = c.execute("SELECT symbol, kind, status, r_mult FROM recs WHERE day>=? AND mode IN ('now','trigger') "
+            rows = c.execute("SELECT symbol, kind, status, r_mult, real_pct FROM recs WHERE day>=? AND mode IN ('now','trigger') "
                              "AND status IN ('T1 HIT','T2 HIT','STOP HIT','SQUARED OFF') ORDER BY ts DESC",
                              (since,)).fetchall()
             c.close()
@@ -399,12 +399,15 @@ def live_record(sym, kind, days=60):
 
 
 def live_stats(sym, kind, days=60, last=5):
-    """Forward record of this app's own calls on one symbol/side. -> dict(n, hits, avg_r, last_n, last_avg_r)."""
+    """Forward record of this app's own calls on one symbol/side.
+    -> dict(n, hits, avg_r, last_n, last_avg_r, real_n, real_avg): real_* = calls scored on the real option contract."""
     rows = [x for x in _resolved(days) if x["symbol"] == sym and x["kind"] == kind]  # newest first
     r = [float(x["r_mult"]) for x in rows if x["r_mult"] is not None]
+    rp = [float(x["real_pct"]) for x in rows if x.get("real_pct") is not None]
     tail = r[:last]
     return dict(n=len(rows), hits=sum(x["status"] in ("T1 HIT", "T2 HIT") for x in rows),
-                avg_r=sum(r) / len(r) if r else None, last_n=len(tail), last_avg_r=sum(tail) / len(tail) if tail else None)
+                avg_r=sum(r) / len(r) if r else None, last_n=len(tail), last_avg_r=sum(tail) / len(tail) if tail else None,
+                real_n=len(rp), real_avg=sum(rp) / len(rp) if rp else None)
 
 
 def scorecard(days=28):

@@ -1591,6 +1591,9 @@ def _live_stats(sym, kind):
         return None
 
 
+LIVE_PROOF_N = 20  # live calls scored on real option prices that can stand in for a back-test
+
+
 def proof(a, r):
     """TRADE only when the call has a record behind it: its symbol's past signals made money on REAL option prices
     (12+ trades) and the app's own recent live calls on that symbol/side are not losing. Otherwise PAPER.
@@ -1599,9 +1602,17 @@ def proof(a, r):
     if ls and ls["last_n"] >= 5 and (ls["last_avg_r"] or 0) < 0:
         return dict(trade=False, why=f"demoted: last {ls['last_n']} live calls averaged {ls['last_avg_r']:+.2f}R")
     rb = a.get("rbt")
+    if ls and ls.get("real_n", 0) >= LIVE_PROOF_N and (rb is None or rb["trades"] < 12):
+        # no usable back-test (e.g. MCX: no expired-option history), but a live record scored on the real contracts
+        if ls["real_avg"] > 0:
+            return dict(trade=True, why=f"live calls on real option prices: {ls['real_avg']:+.1f}% avg over "
+                                        f"{ls['real_n']} calls")
+        return dict(trade=False, why=f"live calls lost on real option prices ({ls['real_avg']:+.1f}% avg, "
+                                     f"{ls['real_n']} calls)")
     if not rb or rb["trades"] < 12:
         n = rb["trades"] if rb else 0
-        return dict(trade=False, why=f"unproven: {n} past trades on real option prices (needs 12+)")
+        live = f", {ls['real_n']}/{LIVE_PROOF_N} live calls priced" if ls and ls.get("real_n") else ""
+        return dict(trade=False, why=f"unproven: {n} past trades on real option prices (needs 12+){live}")
     if rb["avg"] <= 0:
         return dict(trade=False, why=f"past signals lost on real option prices ({rb['avg'] * 100:+.1f}% per trade, "
                                      f"{rb['trades']} trades)")
