@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS recs(
 CREATE TABLE IF NOT EXISTS alerts(
   id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, key TEXT UNIQUE, symbol TEXT, kind TEXT, text TEXT,
   sent INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS heartbeat(name TEXT PRIMARY KEY, ts TEXT, info TEXT);
 """
 
 
@@ -163,6 +164,29 @@ def risk_status(P, now, scope="trade"):
                 left=max(limit + min(pnl, 0), 0) if limit else None, trades_today=n_today, streak=streak,
                 week_pnl=week_pnl, week_limit=wk, size_factor=size_factor,
                 open_index=[(r.symbol, r.kind) for r in opn.itertuples() if r.symbol in INDEX_GROUP])
+
+
+def heartbeat(name, info=""):
+    """'I am alive' mark for a long-running process (always-on engine, live trigger watcher)."""
+    try:
+        c = conn()
+        c.execute("INSERT INTO heartbeat(name, ts, info) VALUES(?,?,?) ON CONFLICT(name) DO UPDATE SET ts=excluded.ts, "
+                  "info=excluded.info", (name, pd.Timestamp.now(tz=E.IST).isoformat(timespec="seconds"), str(info)[:200]))
+        c.commit()
+        c.close()
+    except Exception:
+        pass
+
+
+def heartbeat_age(name):
+    """Seconds since `name` last reported, or None if it never has (or the journal can't be read)."""
+    try:
+        c = conn()
+        r = c.execute("SELECT ts FROM heartbeat WHERE name=?", (name,)).fetchone()
+        c.close()
+        return None if not r else (pd.Timestamp.now(tz=E.IST) - pd.Timestamp(r[0])).total_seconds()
+    except Exception:
+        return None
 
 
 def risk_controls(P, now):

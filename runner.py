@@ -167,17 +167,26 @@ def one_pass(cfg):
 def main():
     once = "--once" in sys.argv
     cloud = "--cloud" in sys.argv  # scheduled cloud run: default settings, skip closed markets and holidays
+    vm = "--vm" in sys.argv  # always-on server (e.g. Oracle Cloud): default settings from env, every minute, forever
     print("Background engine started. Settings from", paper.SETTINGS.name, "| Ctrl+C to stop")
     tok, chat = paper.telegram_creds()
     print("Telegram:", "configured" if tok and chat else "not configured (alerts logged in the app only)")
     while True:
         try:
-            cfg = paper.load_settings()
+            cfg = default_settings() if vm else paper.load_settings()
         except FileNotFoundError:
             if cloud:
                 cfg = default_settings()
             else:
                 cfg = None
+        if vm:
+            cfg["every"] = int(os.environ.get("ENGINE_EVERY", "60"))
+            paper.heartbeat("vm-engine", f"{len(cfg['symbols'])} symbols")
+        if cloud:  # GitHub Actions is the backup: stand down while the always-on engine is reporting
+            age = paper.heartbeat_age("vm-engine")
+            if age is not None and age < 600:
+                print(f"Always-on engine reported {age:.0f}s ago: this scheduled run is not needed")
+                return
         if cfg is None:
             print("No saved settings yet: open the app > Paper trading & alerts > 'Save settings for background engine'.")
             if once:
@@ -188,6 +197,9 @@ def main():
         if cloud and (not session_live(cfg["symbols"], now) or market_holiday(now)):
             print(f"[{now:%H:%M:%S}] markets closed or holiday: nothing to do")
             return
+        if vm and (not session_live(cfg["symbols"], now) or market_holiday(now)):
+            time.sleep(300)  # closed: keep the heartbeat going, check again in 5 minutes
+            continue
         if once or session_live(cfg["symbols"], now):
             try:
                 one_pass(cfg)
