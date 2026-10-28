@@ -688,8 +688,13 @@ def simple_view():
                 dl = {s: deals.line(s) for s in {s for s, _, _ in live}}  # NSE bulk/block deals: context only
             except Exception:
                 dl = {}
+            try:
+                import ai_news
+                ai = {s: ai_news.line(s, r.get("kind")) for s, r, _ in live}  # AI reading of fresh filings
+            except Exception:
+                ai = {}
             for s, r, d in live:
-                r = dict(r, deals_line=dl.get(s, ""))
+                r = dict(r, deals_line=dl.get(s, ""), ai_line=ai.get(s, ""))
                 ring = ' style="outline:2px solid #ffb400;outline-offset:2px;border-radius:16px"' if s == focus else ""
                 st.html(f'<div class="tk"><div{ring}>' + ui_kit.call_card(s, r, view, d) + '</div></div>')
                 if r.get("strike") or view == "Futures":  # tap the copy icon, paste into the broker's search

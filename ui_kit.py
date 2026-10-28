@@ -1143,6 +1143,8 @@ def call_card(sym, r, view="Options", duration="Intraday"):
             f'<span>{"⚡" if live else "⏳"}</span></div><div class="top">{_avatar(sym)}<div>'
             f'<div class="nm">{escape(sym)}{chip}</div><div class="tg" style="color:{_G if ce else _R}">'
             f'{"↗ BULLISH" if ce else "↘ BEARISH"}</div></div>{status}</div><div class="legs">{legs}</div>{rows}'
+            + (f'<div class="ft" style="color:{"#ffb400" if r["ai_line"].startswith("⚠") else "#d9cfe6"}">'
+               f'{escape(r["ai_line"])}</div>' if r.get("ai_line") else "")
             + (f'<div class="ft" style="color:#d9cfe6">{escape(r["deals_line"])}</div>' if r.get("deals_line") else "")
             + (f'<div class="ft">{escape(" · ".join(ft))}</div>' if ft else "") + '</div></div>')
 

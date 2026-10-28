@@ -45,6 +45,10 @@ def _name_map():
     return {_norm(n): s for s, n in zip(u.symbol, u.name) if n}
 
 
+def _known():
+    return set(symbols.universe().symbol)
+
+
 @st.cache_data(ttl=600, show_spinner=False)
 def announcements():
     """Latest ~200 NSE corporate filings -> DataFrame[ts, symbol, company, subject, category, reading, alert, link]."""
@@ -53,7 +57,7 @@ def announcements():
         f = feedparser.parse(r.content)
     except Exception:
         return pd.DataFrame(columns=["ts", "symbol", "company", "subject", "category", "reading", "alert", "link"])
-    names, rows = _name_map(), []
+    names, known, rows = _name_map(), _known(), []
     for e in f.entries:
         desc = e.get("description") or e.get("summary") or ""
         subject = desc.split("SUBJECT:")[-1].strip() if "SUBJECT:" in desc else desc
@@ -65,14 +69,17 @@ def announcements():
             continue
         link = e.get("link", "")
         m = re.search(r"/corporate/([A-Z0-9&\-]+?)_\d{8}", link)
-        sym = m.group(1) if m else names.get(_norm(e.get("title", "")))
+        sym = m.group(1) if m else None
+        if sym not in known:  # file names are not always the symbol ("NAUKRI2_..."): fall back to the company name
+            sym = names.get(_norm(e.get("title", ""))) or (re.sub(r"\d+$", "", sym) if sym else None)
         try:
             ts = pd.to_datetime(e.get("published"), format="%d-%b-%Y %H:%M:%S").tz_localize(E.IST)
         except Exception:
             ts = pd.NaT
         rows.append(dict(ts=ts, symbol=sym, company=e.get("title", ""), subject=subject[:160], category=cat[0],
-                         reading=cat[1], alert=cat[2], link=link))
-    return pd.DataFrame(rows)
+                         reading=cat[1], alert=cat[2], link=link, text=desc[:1500]))
+    return pd.DataFrame(rows, columns=["ts", "symbol", "company", "subject", "category", "reading", "alert", "link",
+                                       "text"])
 
 
 def catalysts(sym, now, hours=24):

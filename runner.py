@@ -155,6 +155,11 @@ def one_pass(cfg):
     new = paper.push_signals(recs, now, P.get("alert_grade", "C"), send=send)  # CALL/PUT alerts to the phone
     new += paper.push_horizons(symbols, now, P.get("alert_grade", "C"), fx, send=send)  # BTST / 2-day before close
     new += paper.push_news(symbols, now, send=send)  # NSE corporate filings on watched symbols (context)
+    try:  # AI reading of new filings (Gemini free tier, capped; stored once per filing): shown on the cards
+        import ai_news
+        ai_news.score_filings(set(symbols) | set(wide))
+    except Exception:
+        traceback.print_exc()
     new += paper.notify(paper.paper_step(results, P, now), send=send)
     new += paper.notify(health_events(results, now, bool(uf.analytics_token())), send=send)
     src = "Upstox" if E.UPSTOX else "Kite" if E.KITE is not None else "Yahoo/NSE"
